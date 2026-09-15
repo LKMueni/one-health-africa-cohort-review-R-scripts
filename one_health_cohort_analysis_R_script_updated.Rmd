@@ -1,0 +1,8024 @@
+---
+title: "Population-based cohorts in Africa: One Health scoping review"
+author: "Lydiah Kisoo"
+date: "`r Sys.Date()`"
+output:
+  word_document:
+    toc: true
+    toc_depth: 3
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+---
+
+# Overview
+
+This R Markdown document contains the reproducible workflow used for the
+scoping review of population-based cohorts in Africa with relevance to
+One Health research.
+
+The analytical unit is the cohort/site record as some publications described more than one cohort conducted in different sites in the same manner. Harmonised cohort names are
+used to link extraction sheets, while `cohort_id` is used for cohort-level
+counts and denominators because some publications or networks report more
+than one cohort/site together.
+
+# 1. Setup
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.align = "center",
+  dpi = 300
+)
+
+options(stringsAsFactors = FALSE)
+```
+
+```{r packages}
+library(readxl)
+library(readr)
+library(revtools)
+library(stringdist)
+library(dplyr)
+library(stringr)
+library(tidyr)
+library(purrr)
+library(tibble)
+library(forcats)
+library(ggplot2)
+library(scales)
+library(flextable)
+library(officer)
+library(sandwich)
+library(lmtest)
+library(countrycode)
+library(sf)
+library(rnaturalearth)
+library(rnaturalearthdata)
+library(ggrepel)
+library(ggspatial)
+```
+
+# 2. Bibliographic search cleaning and deduplication
+
+All files are expected to be stored in the same folder as this R Markdown
+file.
+
+```{r search-deduplication}
+if (!file.exists("combined search.csv")) {
+  stop("Cannot find 'combined search.csv' in the current folder.")
+}
+
+combineddata <- read.csv(
+  "combined search.csv",
+  stringsAsFactors = FALSE,
+  check.names = FALSE
+)
+
+cat("Records imported:", nrow(combineddata), "\n")
+
+cleaneddataset <- combineddata %>%
+  mutate(
+    Title = iconv(
+      Title,
+      from = "",
+      to = "UTF-8",
+      sub = "byte"
+    )
+  )
+
+write.csv(
+  cleaneddataset,
+  "search_records_encoding_cleaned.csv",
+  row.names = FALSE
+)
+
+duplicate_group <- revtools::find_duplicates(
+  data = cleaneddataset,
+  match_variable = "Title",
+  match_function = "stringdist",
+  method = "osa",
+  threshold = 5,
+  to_lower = TRUE,
+  remove_punctuation = TRUE
+)
+
+search_with_duplicate_group <- cleaneddataset %>%
+  mutate(
+    duplicate_group = duplicate_group
+  )
+
+potential_duplicates <- search_with_duplicate_group %>%
+  group_by(duplicate_group) %>%
+  filter(n() > 1) %>%
+  ungroup() %>%
+  arrange(duplicate_group)
+
+write.csv(
+  potential_duplicates,
+  "potential_duplicate_records.csv",
+  row.names = FALSE
+)
+
+# Final duplicate groups were manually reviewed during the review process.
+deduplicated_search <- search_with_duplicate_group %>%
+  group_by(duplicate_group) %>%
+  slice(1L) %>%
+  ungroup()
+
+write.csv(
+  deduplicated_search,
+  "search_records_deduplicated.csv",
+  row.names = FALSE
+)
+
+cat(
+  "Records before deduplication:",
+  nrow(cleaneddataset),
+  "\n"
+)
+
+cat(
+  "Records after deduplication:",
+  nrow(deduplicated_search),
+  "\n"
+)
+```
+
+# 3. Load extracted cohort data
+
+```{r load-extracted-data}
+required_extraction_files <- c(
+  "cohort_info2.xlsx",
+  "oh_outcomes2.xlsx",
+  "oh_exposures2.xlsx",
+  "outcome_details2.xlsx"
+)
+
+missing_extraction_files <- required_extraction_files[
+  !file.exists(required_extraction_files)
+]
+
+if (length(missing_extraction_files) > 0) {
+  stop(
+    "Missing required file(s): ",
+    paste(
+      missing_extraction_files,
+      collapse = ", "
+    )
+  )
+}
+
+cohort_info <- read_excel(
+  "cohort_info2.xlsx"
+)
+
+oh_outcomes <- read_excel(
+  "oh_outcomes2.xlsx"
+)
+
+oh_exposures <- read_excel(
+  "oh_exposures2.xlsx"
+)
+
+outcome_details <- read_excel(
+  "outcome_details2.xlsx"
+)
+
+cat(
+  "Cohort information rows:",
+  nrow(cohort_info),
+  "\n"
+)
+
+cat(
+  "Outcome rows:",
+  nrow(oh_outcomes),
+  "\n"
+)
+
+cat(
+  "Exposure rows:",
+  nrow(oh_exposures),
+  "\n"
+)
+
+cat(
+  "Outcome-detail rows:",
+  nrow(outcome_details),
+  "\n"
+)
+```
+
+# 4. Helper functions
+
+```{r helper-functions}
+clean_text <- function(x) {
+
+  x <- as.character(x)
+
+  x <- str_replace_all(
+    x,
+    "\u2019|\u2018",
+    "'"
+  )
+
+  x <- str_replace_all(
+    x,
+    "\u201c|\u201d",
+    '"'
+  )
+
+  x <- str_replace_all(
+    x,
+    "\u2013|\u2014",
+    "-"
+  )
+
+  x <- str_replace_all(
+    x,
+    "\u03b2",
+    "beta"
+  )
+
+  str_squish(x)
+}
+
+
+to_yesno_strict <- function(x) {
+
+  if (is.numeric(x)) {
+
+    return(
+      ifelse(
+        !is.na(x) & x == 1,
+        "Yes",
+        "No"
+      )
+    )
+  }
+
+  x <- tolower(
+    trimws(
+      as.character(x)
+    )
+  )
+
+  ifelse(
+    x %in% c(
+      "yes",
+      "y",
+      "1",
+      "true",
+      "present"
+    ),
+    "Yes",
+    "No"
+  )
+}
+
+
+to_yesno_exposure <- function(x) {
+
+  x_chr <- trimws(
+    as.character(x)
+  )
+
+  x_low <- str_replace_all(
+    tolower(x_chr),
+    "\\s+",
+    " "
+  )
+
+  no_patterns <- c(
+    "",
+    "no",
+    "n",
+    "0",
+    "false",
+    "absent",
+    "none",
+    "not assessed",
+    "none assessed",
+    "not reported",
+    "na",
+    "n/a"
+  )
+
+  ifelse(
+    !is.na(x_chr) &
+      !(x_low %in% no_patterns),
+    "Yes",
+    "No"
+  )
+}
+
+
+collapse_unique_text <- function(
+    x,
+    sep = "; "
+) {
+
+  x <- clean_text(x)
+
+  x <- x[
+    !is.na(x) &
+      x != "" &
+      tolower(x) != "none" &
+      tolower(x) != "not specified"
+  ]
+
+  x <- unique(x)
+
+  if (length(x) == 0) {
+    return(NA_character_)
+  }
+
+  paste(
+    x,
+    collapse = sep
+  )
+}
+
+
+flag_detect <- function(
+    x,
+    pattern
+) {
+
+  x <- clean_text(x)
+
+  ifelse(
+    any(
+      str_detect(
+        str_to_lower(x),
+        pattern
+      ),
+      na.rm = TRUE
+    ),
+    "Yes",
+    "No"
+  )
+}
+
+
+yes_count <- function(
+    df,
+    cols
+) {
+
+  cols <- intersect(
+    cols,
+    names(df)
+  )
+
+  if (length(cols) == 0) {
+
+    rep(
+      0L,
+      nrow(df)
+    )
+
+  } else {
+
+    rowSums(
+      df[, cols, drop = FALSE] == "Yes",
+      na.rm = TRUE
+    )
+  }
+}
+
+
+force_yesno <- function(x) {
+
+  ifelse(
+    !is.na(x) &
+      as.character(x) == "Yes",
+    "Yes",
+    "No"
+  )
+}
+
+
+is_yes <- function(x) {
+
+  x2 <- tolower(
+    clean_text(x)
+  )
+
+  case_when(
+
+    is.na(x2) ~ FALSE,
+
+    x2 %in% c(
+      "1",
+      "yes",
+      "y",
+      "true",
+      "present",
+      "reported"
+    ) ~ TRUE,
+
+    x2 %in% c(
+      "0",
+      "no",
+      "n",
+      "false",
+      "absent",
+      "not reported",
+      "",
+      "na",
+      "n/a"
+    ) ~ FALSE,
+
+    suppressWarnings(
+      !is.na(as.numeric(x2)) &
+        as.numeric(x2) > 0
+    ) ~ TRUE,
+
+    TRUE ~ FALSE
+  )
+}
+
+
+clean_country_type <- function(x) {
+
+  x <- clean_text(x)
+
+  case_when(
+
+    is.na(x) | x == "" ~
+      NA_character_,
+
+    str_detect(
+      x,
+      regex(
+        "^multinational",
+        ignore_case = TRUE
+      )
+    ) ~ "Multi-country",
+
+    str_detect(
+      x,
+      regex(
+        paste0(
+          "multiple countries|multi-country|multi country|",
+          "[0-9]+\\s+sites|[0-9]+\\s+countries|",
+          "african sites include"
+        ),
+        ignore_case = TRUE
+      )
+    ) ~ "Multi-country",
+
+    str_count(x, ",") >= 1 ~
+      "Multi-country",
+
+    str_count(x, ";") >= 1 ~
+      "Multi-country",
+
+    str_detect(
+      x,
+      regex(
+        "\\band\\b",
+        ignore_case = TRUE
+      )
+    ) ~ "Multi-country",
+
+    TRUE ~ "Single country"
+  )
+}
+
+
+classify_region <- function(
+    country_clean
+) {
+
+  case_when(
+
+    is.na(country_clean) |
+      country_clean == "" ~
+      NA_character_,
+
+    clean_country_type(
+      country_clean
+    ) == "Multi-country" ~
+      "Multinational",
+
+    str_detect(
+      country_clean,
+      regex(
+        paste0(
+          "kenya|uganda|tanzania|ethiopia|sudan|",
+          "south sudan|rwanda|burundi|eritrea|",
+          "somalia|djibouti|seychelles"
+        ),
+        ignore_case = TRUE
+      )
+    ) ~ "East Africa",
+
+    str_detect(
+      country_clean,
+      regex(
+        paste0(
+          "ghana|nigeria|gambia|the gambia|senegal|",
+          "mali|burkina faso|niger|benin|",
+          "côte d'ivoire|cote d'ivoire|ivory coast|",
+          "guinea-bissau|guinea|liberia|sierra leone|togo"
+        ),
+        ignore_case = TRUE
+      )
+    ) ~ "West Africa",
+
+    str_detect(
+      country_clean,
+      regex(
+        paste0(
+          "south africa|zimbabwe|zambia|mozambique|",
+          "malawi|namibia|botswana|angola|madagascar|",
+          "mauritius|lesotho|eswatini"
+        ),
+        ignore_case = TRUE
+      )
+    ) ~ "Southern Africa",
+
+    str_detect(
+      country_clean,
+      regex(
+        paste0(
+          "democratic republic of congo|",
+          "democratic republic of the congo|",
+          "dr congo|drc|republic of congo|",
+          "central african republic|cameroon|",
+          "chad|gabon|equatorial guinea"
+        ),
+        ignore_case = TRUE
+      )
+    ) ~ "Central Africa",
+
+    str_detect(
+      country_clean,
+      regex(
+        "egypt|algeria|morocco|tunisia|libya",
+        ignore_case = TRUE
+      )
+    ) ~ "North Africa",
+
+    TRUE ~ NA_character_
+  )
+}
+
+
+extract_sample_size_numeric <- function(x) {
+
+  x <- clean_text(x)
+
+  if (
+    is.na(x) ||
+      x == ""
+  ) {
+    return(NA_real_)
+  }
+
+  x2 <- x %>%
+
+    str_replace_all(
+      "(?<=\\d)\\.(?=\\d{3}(\\D|$))",
+      ""
+    ) %>%
+
+    str_replace_all(
+      ",",
+      ""
+    )
+
+  m1 <- str_match(
+    x2,
+    regex(
+      "humans?\\s*:?\\s*([0-9]+)",
+      ignore_case = TRUE
+    )
+  )
+
+  if (!is.na(m1[1, 2])) {
+    return(
+      as.numeric(
+        m1[1, 2]
+      )
+    )
+  }
+
+  m2 <- str_match(
+    x2,
+    regex(
+      "([0-9]+)\\s*humans?",
+      ignore_case = TRUE
+    )
+  )
+
+  if (!is.na(m2[1, 2])) {
+    return(
+      as.numeric(
+        m2[1, 2]
+      )
+    )
+  }
+
+  nums <- str_extract_all(
+    x2,
+    "[0-9]+"
+  )[[1]]
+
+  if (length(nums) == 0) {
+    return(NA_real_)
+  }
+
+  as.numeric(
+    nums[1]
+  )
+}
+
+
+categorise_sample_size <- function(n) {
+
+  case_when(
+
+    is.na(n) ~
+      NA_character_,
+
+    n < 1000 ~
+      "<1,000",
+
+    n >= 1000 &
+      n < 20000 ~
+      "1,000-19,999",
+
+    n >= 20000 &
+      n < 100000 ~
+      "20,000-99,999",
+
+    n >= 100000 ~
+      ">=100,000",
+
+    TRUE ~ NA_character_
+  )
+}
+
+
+clean_setting <- function(x) {
+
+  x <- clean_text(x)
+
+  case_when(
+
+    str_detect(
+      x,
+      regex(
+        paste0(
+          "mixed rural.*urban|rural.*urban|",
+          "general population \\(rural.?&.?urban\\)"
+        ),
+        ignore_case = TRUE
+      )
+    ) ~ "Mixed rural and urban",
+
+    str_detect(
+      x,
+      regex(
+        "^urban|urban population",
+        ignore_case = TRUE
+      )
+    ) ~ "Urban",
+
+    str_detect(
+      x,
+      regex(
+        "^rural|rural population",
+        ignore_case = TRUE
+      )
+    ) ~ "Rural",
+
+    TRUE ~ "Other/unclear"
+  )
+}
+
+
+categorise_decade <- function(year) {
+
+  case_when(
+
+    is.na(year) ~
+      NA_character_,
+
+    year < 1980 ~
+      "<=1970s",
+
+    year >= 1980 &
+      year < 1990 ~
+      "1980s",
+
+    year >= 1990 &
+      year < 2000 ~
+      "1990s",
+
+    year >= 2000 &
+      year < 2010 ~
+      "2000s",
+
+    year >= 2010 &
+      year < 2020 ~
+      "2010s",
+
+    year >= 2020 ~
+      "2020s",
+
+    TRUE ~ NA_character_
+  )
+}
+
+
+categorise_status <- function(
+    end_year
+) {
+
+  case_when(
+
+    is.na(end_year) ~
+      "Ongoing",
+
+    TRUE ~
+      "Ended"
+  )
+}
+
+
+parse_followup_months <- function(x) {
+
+  x <- tolower(
+    clean_text(x)
+  )
+
+  if (
+    is.na(x) ||
+      x == ""
+  ) {
+    return(NA_real_)
+  }
+
+  if (
+    str_detect(
+      x,
+      paste0(
+        "baseline|single time point|point-in-time|",
+        "single cross-sectional|cross-sectional survey"
+      )
+    )
+  ) {
+    return(0)
+  }
+
+  if (
+    str_detect(
+      x,
+      "days?\\s*3\\s*&\\s*7"
+    ) ||
+      str_detect(
+        x,
+        "days?\\s*2\\s*&\\s*7"
+      )
+  ) {
+    return(14 / 30.4375)
+  }
+
+  if (
+    str_detect(
+      x,
+      "14 days|2 weeks"
+    )
+  ) {
+    return(14 / 30.4375)
+  }
+
+  if (
+    str_detect(
+      x,
+      "9 days"
+    )
+  ) {
+    return(9 / 30.4375)
+  }
+
+  if (
+    str_detect(
+      x,
+      "6 weeks"
+    )
+  ) {
+    return(6 / 4.345)
+  }
+
+  if (
+    str_detect(
+      x,
+      "weekly"
+    )
+  ) {
+    return(7 / 30.4375)
+  }
+
+  if (
+    str_detect(
+      x,
+      "bi weekly|bi-weekly"
+    )
+  ) {
+    return(14 / 30.4375)
+  }
+
+  if (
+    str_detect(
+      x,
+      "hourly"
+    )
+  ) {
+    return(
+      1 / 24 / 30.4375
+    )
+  }
+
+  if (
+    str_detect(
+      x,
+      "daily & monthly"
+    )
+  ) {
+    return(1)
+  }
+
+  if (
+    str_detect(
+      x,
+      "daily"
+    )
+  ) {
+    return(
+      1 / 30.4375
+    )
+  }
+
+  if (
+    str_detect(
+      x,
+      "anual|annual"
+    )
+  ) {
+    return(12)
+  }
+
+  if (
+    str_detect(
+      x,
+      "12-month"
+    )
+  ) {
+    return(12)
+  }
+
+  if (
+    str_detect(
+      x,
+      "24-month"
+    )
+  ) {
+    return(24)
+  }
+
+  if (
+    str_detect(
+      x,
+      paste0(
+        "continuous|periodic|event-driven|",
+        "longitudinal|registration|surveillance"
+      )
+    )
+  ) {
+
+    nums <- suppressWarnings(
+      as.numeric(
+        str_extract_all(
+          x,
+          "\\d+\\.?\\d*"
+        )[[1]]
+      )
+    )
+
+    nums <- nums[
+      !is.na(nums)
+    ]
+
+    if (
+      length(nums) > 0
+    ) {
+      return(
+        max(nums)
+      )
+    }
+
+    return(
+      NA_real_
+    )
+  }
+
+  if (
+    str_detect(
+      x,
+      "^\\d+\\.?\\d*$"
+    )
+  ) {
+    return(
+      as.numeric(x)
+    )
+  }
+
+  if (
+    str_detect(
+      x,
+      "week"
+    )
+  ) {
+
+    num <- suppressWarnings(
+      parse_number(x)
+    )
+
+    if (
+      !is.na(num)
+    ) {
+      return(
+        num / 4.345
+      )
+    }
+  }
+
+  if (
+    str_detect(
+      x,
+      "day"
+    )
+  ) {
+
+    num <- suppressWarnings(
+      parse_number(x)
+    )
+
+    if (
+      !is.na(num)
+    ) {
+      return(
+        num / 30.4375
+      )
+    }
+  }
+
+  if (
+    str_detect(
+      x,
+      "month"
+    )
+  ) {
+
+    num <- suppressWarnings(
+      parse_number(x)
+    )
+
+    if (
+      !is.na(num)
+    ) {
+      return(num)
+    }
+  }
+
+  num <- suppressWarnings(
+    parse_number(x)
+  )
+
+  if (
+    !is.na(num)
+  ) {
+    return(num)
+  }
+
+  NA_real_
+}
+
+
+categorise_followup_range <- function(
+    min_m,
+    max_m
+) {
+
+  case_when(
+
+    is.na(min_m) &
+      is.na(max_m) ~
+      NA_character_,
+
+    !is.na(max_m) &
+      max_m == 0 ~
+      "Baseline only",
+
+    !is.na(max_m) &
+      max_m > 0 &
+      max_m <= 1 ~
+      ">0-1 month",
+
+    !is.na(max_m) &
+      max_m > 1 &
+      max_m <= 6 ~
+      ">1-6 months",
+
+    !is.na(max_m) &
+      max_m > 6 &
+      max_m <= 12 ~
+      ">6-12 months",
+
+    !is.na(max_m) &
+      max_m > 12 &
+      max_m <= 24 ~
+      ">12-24 months",
+
+    !is.na(max_m) &
+      max_m > 24 ~
+      ">24 months",
+
+    TRUE ~
+      NA_character_
+  )
+}
+
+
+summ_cat <- function(
+    data,
+    var
+) {
+
+  tmp <- data %>%
+
+    filter(
+
+      !is.na(
+        {{ var }}
+      ),
+
+      {{ var }} != "",
+
+      !str_detect(
+        as.character(
+          {{ var }}
+        ),
+        regex(
+          "unclear|other",
+          ignore_case = TRUE
+        )
+      )
+    )
+
+  denom <- nrow(tmp)
+
+  tmp %>%
+
+    count(
+      {{ var }},
+      name = "n"
+    ) %>%
+
+    mutate(
+      percent =
+        round(
+          100 * n / denom,
+          1
+        )
+    ) %>%
+
+    rename(
+      category =
+        {{ var }}
+    ) %>%
+
+    mutate(
+      category =
+        as.character(category)
+    )
+}
+
+
+summ_binary_vars <- function(
+    data,
+    vars,
+    labels,
+    variable_name
+) {
+
+  tibble(
+
+    variable =
+      variable_name,
+
+    category =
+      labels,
+
+    n =
+      map_int(
+        vars,
+        ~ sum(
+          is_yes(
+            data[[.x]]
+          ),
+          na.rm = TRUE
+        )
+      ),
+
+    percent =
+      round(
+        100 * n /
+          nrow(data),
+        1
+      )
+  ) %>%
+
+    filter(
+      n > 0
+    ) %>%
+
+    arrange(
+      desc(n),
+      category
+    )
+}
+```
+
+# 5. Harmonise cohort names
+
+```{r cohort-name-harmonisation}
+name_crosswalk <- tibble::tribble(
+
+  ~raw_name,
+  ~harmonized_name,
+
+  "Manyatta HDSS",
+  "Manyatta Karemo HDSS",
+
+  "Karemo HDSS",
+  "Manyatta Karemo HDSS",
+
+  "Manyatta/Karemo HDSS",
+  "Manyatta Karemo HDSS",
+
+  "Kilifi HDSS2",
+  "Kilifi HDSS",
+
+  "Kisumu Ahero/KEMRI CDC",
+  "Kisumu KEMRI CDC",
+
+  "Dinamo HDSS/Dikgale",
+  "Dinamo HDSS",
+
+  "MLSFH/gen-malawi",
+  "MLSFH",
+
+  "Djicoroni Para&Banconi, Bamako_CHAMPS_Network",
+  "Harar_Djicoroni_CHAMPS",
+
+  "Harar_CHAMPS_Network",
+  "Harar_Djicoroni_CHAMPS",
+
+  paste0(
+    "GRT-INSPIRED HDSS (Gauteng Research Triangle Initiative ",
+    "for the Study of Population, Infrastructure and Regional ",
+    "Economic Development)"
+  ),
+  "GRT-INSPIRED HDSS",
+
+  "GRT-INSPIRED HDSS (Gauteng)",
+  "GRT-INSPIRED HDSS",
+
+  paste0(
+    "C-SHARP HDSS (Cape Town Surveillance through ",
+    "Healthcare Action Research Project)"
+  ),
+  "C-SHARP HDSS",
+
+  "C-SHARP HDSS (Western Cape)",
+  "C-SHARP HDSS",
+
+  "BAMMISHO",
+  "BAMMISHO HDSS",
+
+  paste0(
+    "Northwestern Tigray Rabies Exposure Cohort ",
+    "(Suhul Hospital Catchment)"
+  ),
+  "Northwestern Tigray Rabies Exposure Cohort",
+
+  paste0(
+    "PATHOME Study (Pathogen Transmission and Health ",
+    "Outcome Models of Enteric Disease)"
+  ),
+  "PATHOME Study",
+
+  "Dielmo & Ndiop Malaria Cohort",
+  "Dielmo and Ndiop Malaria Cohorts (Senegal)"
+)
+
+
+harmonize_cohort_name <- function(
+    x,
+    crosswalk = name_crosswalk
+) {
+
+  x_clean <- clean_text(x)
+
+  matched <-
+    crosswalk$harmonized_name[
+      match(
+        x_clean,
+        crosswalk$raw_name
+      )
+    ]
+
+  ifelse(
+    is.na(matched),
+    x_clean,
+    matched
+  )
+}
+
+
+# Preserve the original cohort/site record
+# before harmonising cohort names.
+
+cohort_info <- cohort_info %>%
+
+  mutate(
+
+    cohort_record_id =
+      row_number(),
+
+    cohort_name_raw =
+      clean_text(
+        cohort_name
+      ),
+
+    cohort_name =
+      harmonize_cohort_name(
+        cohort_name_raw
+      )
+  )
+
+
+oh_outcomes <- oh_outcomes %>%
+
+  mutate(
+
+    cohort_name_raw =
+      clean_text(
+        cohort_name
+      ),
+
+    cohort_name =
+      harmonize_cohort_name(
+        cohort_name_raw
+      )
+  )
+
+
+oh_exposures <- oh_exposures %>%
+
+  mutate(
+
+    cohort_name_raw =
+      clean_text(
+        cohort_name
+      ),
+
+    cohort_name =
+      harmonize_cohort_name(
+        cohort_name_raw
+      )
+  )
+
+
+outcome_details <- outcome_details %>%
+
+  mutate(
+
+    cohort_name_raw =
+      clean_text(
+        cohort_name
+      ),
+
+    cohort_name =
+      harmonize_cohort_name(
+        cohort_name_raw
+      )
+  )
+```
+
+# 6. Clean and collapse outcome data
+
+```{r clean-outcomes}
+if (
+  all(
+    c(
+      "Brucellosis...30",
+      "Brucellosis...36"
+    ) %in%
+      names(oh_outcomes)
+  )
+) {
+
+  oh_outcomes <-
+    oh_outcomes %>%
+
+    mutate(
+
+      Brucellosis =
+        ifelse(
+
+          to_yesno_strict(
+            `Brucellosis...30`
+          ) == "Yes" |
+
+            to_yesno_strict(
+              `Brucellosis...36`
+            ) == "Yes",
+
+          "Yes",
+          "No"
+        )
+    ) %>%
+
+    select(
+      -`Brucellosis...30`,
+      -`Brucellosis...36`
+    )
+}
+
+
+outcome_cols_raw <-
+  setdiff(
+
+    names(
+      oh_outcomes
+    ),
+
+    c(
+      "cohort_name",
+      "cohort_name_raw"
+    )
+  )
+
+
+oh_outcomes_cohort <-
+  oh_outcomes %>%
+
+  mutate(
+    across(
+      all_of(
+        outcome_cols_raw
+      ),
+      to_yesno_strict
+    )
+  ) %>%
+
+  group_by(
+    cohort_name
+  ) %>%
+
+  summarise(
+
+    across(
+
+      all_of(
+        outcome_cols_raw
+      ),
+
+      ~ ifelse(
+        any(
+          .x == "Yes"
+        ),
+        "Yes",
+        "No"
+      )
+    ),
+
+    .groups =
+      "drop"
+  )
+
+
+outcome_list_by_cohort <-
+  oh_outcomes_cohort %>%
+
+  rowwise() %>%
+
+  mutate(
+
+    outcomes_list =
+      paste(
+
+        names(
+          c_across(
+            all_of(
+              outcome_cols_raw
+            )
+          )
+        )[
+          c_across(
+            all_of(
+              outcome_cols_raw
+            )
+          ) == "Yes"
+        ],
+
+        collapse =
+          "; "
+      ),
+
+    outcomes_list =
+      ifelse(
+        outcomes_list == "",
+        NA_character_,
+        outcomes_list
+      )
+  ) %>%
+
+  ungroup() %>%
+
+  select(
+    cohort_name,
+    outcomes_list
+  )
+```
+
+# 7. Define and collapse One Health exposure variables
+
+```{r exposure-groups}
+animal_vars <- c(
+
+  "Wildlife/wildbird Proximity or contact",
+  "Livestock ownership (general)",
+  "Livestock ownership (Pig)",
+  "Poultry/birds Ownership",
+  "Livestock ownership (Goat)",
+  "Livestock ownership (Cattle)",
+  "Livestock ownership (Sheep)",
+  "Small animals",
+  "Bats contact",
+  "Bushmeat consumption",
+  "Cat contact/ownership",
+  "Dog contact/bites",
+  "Animal Sampling",
+  "Animal Health Practices(Surveys - Biosecurity, vaccination)",
+  "Antibiotic use in animals",
+  "Dog Vaccination"
+)
+
+
+ecosystem_vars <- c(
+
+  "WASH (Hand washing, saniation, access to clean water)",
+  "Natural water body contact",
+  "Water waste management",
+  "Solid waste management",
+  "WASH(Toilet type)",
+  "Food secutity (nutrition)",
+  "Air pollution(Particulate Matter (PM2.5 or other)",
+  "Air pollution(Energy Source Cooking)",
+  "Air Pollution(Dust exposure, proximity to Road etc)",
+  "Seasonality",
+  "Climate Variables(Temp.)",
+  "Climate Variables(Humidity)",
+  "Climate Variables(Dryness)",
+  "Climate Variables(Rainfall)",
+  "Greenness",
+  "Noise Pollution",
+  "Chemical exposure",
+  "Flooding context",
+  "Soil contact / geophagy",
+  "Other_Environmental sampling"
+)
+
+
+vector_vars <- c(
+
+  "Use of bed nets",
+  "Entomological survey - Mosquitoes(densities etc)",
+  "Entomological survey - Ticks",
+  "Vector exposure(mosquitoes, snails, ticks)"
+)
+
+
+socioeconomic_vars <- c(
+  "Socio-economic Indicators"
+)
+
+
+other_contextual_vars <- c(
+
+  "Geolocation (GPS)",
+  "Residency(Rural/Urban)"
+)
+
+
+occupation_animal_pattern <-
+  paste(
+
+    c(
+      "pastoral",
+      "poultry",
+      "livestock",
+      "hunting",
+      "hunting and farming",
+      "farming and pastoralism"
+    ),
+
+    collapse =
+      "|"
+  )
+
+
+occupation_ecosystem_pattern <-
+  paste(
+
+    c(
+      "farming",
+      "agriculture",
+      "fishermen",
+      "fishing",
+      "mining",
+      "pastoral",
+      "hunting",
+      "poultry"
+    ),
+
+    collapse =
+      "|"
+  )
+
+
+oh_exposures2 <-
+  oh_exposures %>%
+
+  mutate(
+
+    occupation_value =
+      str_to_lower(
+        clean_text(
+          `Occupation_ OH related (Specify)`
+        )
+      ),
+
+    occupation_animal_related =
+      ifelse(
+        str_detect(
+          occupation_value,
+          occupation_animal_pattern
+        ),
+        "Yes",
+        "No"
+      ),
+
+    occupation_ecosystem_related =
+      ifelse(
+        str_detect(
+          occupation_value,
+          occupation_ecosystem_pattern
+        ),
+        "Yes",
+        "No"
+      )
+  )
+
+
+animal_cols <-
+  unique(
+    c(
+      intersect(
+        animal_vars,
+        names(oh_exposures2)
+      ),
+      "occupation_animal_related"
+    )
+  )
+
+
+ecosystem_cols <-
+  unique(
+    c(
+      intersect(
+        ecosystem_vars,
+        names(oh_exposures2)
+      ),
+      "occupation_ecosystem_related"
+    )
+  )
+
+
+vector_cols <-
+  intersect(
+    vector_vars,
+    names(oh_exposures2)
+  )
+
+
+socioeconomic_cols <-
+  intersect(
+    socioeconomic_vars,
+    names(oh_exposures2)
+  )
+
+
+other_contextual_cols <-
+  intersect(
+    other_contextual_vars,
+    names(oh_exposures2)
+  )
+
+
+all_exposure_cols <-
+  unique(
+    c(
+      animal_cols,
+      ecosystem_cols,
+      vector_cols,
+      socioeconomic_cols,
+      other_contextual_cols
+    )
+  )
+
+
+oh_exposures_cohort <-
+  oh_exposures2 %>%
+
+  mutate(
+    across(
+      all_of(
+        all_exposure_cols
+      ),
+      to_yesno_exposure
+    )
+  ) %>%
+
+  group_by(
+    cohort_name
+  ) %>%
+
+  summarise(
+
+    across(
+
+      all_of(
+        all_exposure_cols
+      ),
+
+      ~ ifelse(
+        any(
+          .x == "Yes"
+        ),
+        "Yes",
+        "No"
+      )
+    ),
+
+    .groups =
+      "drop"
+  )
+
+
+cohort_domain_flags <-
+  oh_exposures_cohort %>%
+
+  mutate(
+
+    human_outcome =
+      "Yes",
+
+    animal_exposure_domain =
+      ifelse(
+        yes_count(
+          .,
+          animal_cols
+        ) > 0,
+        "Yes",
+        "No"
+      ),
+
+    ecosystem_exposure_domain =
+      ifelse(
+        yes_count(
+          .,
+          ecosystem_cols
+        ) > 0,
+        "Yes",
+        "No"
+      ),
+
+    vector_exposure_domain =
+      ifelse(
+        yes_count(
+          .,
+          vector_cols
+        ) > 0,
+        "Yes",
+        "No"
+      ),
+
+    socioeconomic_exposure_domain =
+      ifelse(
+        yes_count(
+          .,
+          socioeconomic_cols
+        ) > 0,
+        "Yes",
+        "No"
+      ),
+
+    other_contextual_exposure_domain =
+      ifelse(
+        yes_count(
+          .,
+          other_contextual_cols
+        ) > 0,
+        "Yes",
+        "No"
+      )
+  ) %>%
+
+  select(
+    cohort_name,
+    human_outcome,
+    animal_exposure_domain,
+    ecosystem_exposure_domain,
+    vector_exposure_domain,
+    socioeconomic_exposure_domain,
+    other_contextual_exposure_domain
+  )
+```
+
+# 8. Outcome-detail, population, method, assay and biospecimen flags
+
+```{r outcome-detail-flags}
+outcome_details_cohort <-
+  outcome_details %>%
+
+  group_by(
+    cohort_name
+  ) %>%
+
+  summarise(
+
+    population_type_text =
+      collapse_unique_text(
+        `Population Type/setting for specific outcome`
+      ),
+
+    assessment_methods_text =
+      collapse_unique_text(
+        `Outcome_assessment_method(specific laboratory methods_or_survey)`
+      ),
+
+    biospecimens_text =
+      collapse_unique_text(
+        Biospecimen
+      ),
+
+    .groups =
+      "drop"
+  )
+
+
+population_flags <-
+  outcome_details %>%
+
+  group_by(
+    cohort_name
+  ) %>%
+
+  summarise(
+
+    age_children =
+      flag_detect(
+        `Population Type/setting for specific outcome`,
+        "child|children|infant|newborn|neonat|under 5|<5|0–5|0-5"
+      ),
+
+    age_adolescents =
+      flag_detect(
+        `Population Type/setting for specific outcome`,
+        "adolescent|youth|teen"
+      ),
+
+    age_adults =
+      flag_detect(
+        `Population Type/setting for specific outcome`,
+        "adult|men and women|general population|aged ≥|above 40"
+      ),
+
+    age_all_ages =
+      flag_detect(
+        `Population Type/setting for specific outcome`,
+        "all ages"
+      ),
+
+    sex_male =
+      flag_detect(
+        `Population Type/setting for specific outcome`,
+        "\\bmen\\b|male"
+      ),
+
+    sex_female =
+      flag_detect(
+        `Population Type/setting for specific outcome`,
+        "\\bwomen\\b|female|mother"
+      ),
+
+    sex_both =
+      flag_detect(
+        `Population Type/setting for specific outcome`,
+        "both sexes|all ages & genders|men and women|all ages"
+      ),
+
+    special_pregnant =
+      flag_detect(
+        `Population Type/setting for specific outcome`,
+        "pregnan|gravid|antenatal|anc"
+      ),
+
+    special_hiv =
+      flag_detect(
+        `Population Type/setting for specific outcome`,
+        "hiv|art patients|people living with hiv"
+      ),
+
+    special_hospital =
+      flag_detect(
+        `Population Type/setting for specific outcome`,
+        "hospital|in-patients|facility"
+      ),
+
+    special_deceased =
+      flag_detect(
+        `Population Type/setting for specific outcome`,
+        "deceased|all deaths|mortality"
+      ),
+
+    special_animals =
+      flag_detect(
+        `Population Type/setting for specific outcome`,
+        "cattle|goats|sheep|dogs|livestock|animals|ruminants|equines"
+      ),
+
+    .groups =
+      "drop"
+  )
+
+
+method_flags <-
+  outcome_details %>%
+
+  group_by(
+    cohort_name
+  ) %>%
+
+  summarise(
+
+    questionnaire_data =
+      flag_detect(
+        `Outcome_assessment_method(specific laboratory methods_or_survey)`,
+        paste0(
+          "questionnaire|survey|interview|self-report|caregiver report|",
+          "structured questionnaire|respondent report|oral history|",
+          "symptom diary|self-administered|caregiver recall"
+        )
+      ),
+
+    clinical_data =
+      flag_detect(
+        `Outcome_assessment_method(specific laboratory methods_or_survey)`,
+        paste0(
+          "clinical|physical examination|clinical examination|blood pressure|",
+          "spirometry|anthropometr|clinical measurement|medical records|",
+          "radiology|clinical assessment|clinical follow-up|clinical screening|",
+          "clinical exams|clinical diagnosis|clinical evaluation|",
+          "physician examination|delivery room measurements|",
+          "physical exam|standardized physical measurement|physical measurements"
+        )
+      ),
+
+    routine_data =
+      flag_detect(
+        `Outcome_assessment_method(specific laboratory methods_or_survey)`,
+        paste0(
+          "routine|registry|record|hdss|surveillance|census|",
+          "demographic surveillance|verbal autopsy|facility data|",
+          "data linkage|vital status records|household rosters|",
+          "community reporting|reporting|enumeration|",
+          "mortality records|clinic data"
+        )
+      ),
+
+    laboratory_data =
+      flag_detect(
+        `Outcome_assessment_method(specific laboratory methods_or_survey)`,
+        paste0(
+          "laboratory|serology|pcr|qpcr|rt-pcr|elisa|microscopy|culture|",
+          "sequencing|assay|genexpert|hematology|blood count|biomarker|",
+          "molecular|antibody|antigen|neutralization|haemoglobin|hemoglobin|",
+          "diagnostics|kato-katz|urine filtration|blood film|",
+          "microbiology|microbiological"
+        )
+      ),
+
+    case_based_passive_sentinel_detection =
+      flag_detect(
+        `Outcome_assessment_method(specific laboratory methods_or_survey)`,
+        paste0(
+          "review of hospital diagnosis records|hospital-based morbidity surveillance|",
+          "facility-based morbidity surveillance|hospital-based surveillance|",
+          "facility-based surveillance|",
+          "hospital-based surveillance and laboratory confirmation|",
+          "facility-based surveillance and laboratory confirmation|",
+          "health-facility based surveillance|health facility diagnosis|",
+          "clinical examination and diagnosis at health facilities|",
+          "passive case detection|passive surveillance|",
+          "morbidity surveillance|morbidity reporting|",
+          "clinic follow-up|vital status records, clinic follow-up|sentinel"
+        )
+      ),
+
+    active_surveillance_detection_raw =
+      flag_detect(
+        `Outcome_assessment_method(specific laboratory methods_or_survey)`,
+        paste0(
+          "household surveillance|household-based surveillance|household visits|",
+          "active case-finding|active case detection|active weekly household visits|",
+          "active home visits|repeated household clinical symptom surveillance|",
+          "household surveillance interviews|community follow-up|",
+          "continuous surveillance|longitudinal surveillance|",
+          "routine hdss surveillance|follow-up tracing|surveillance surveys|",
+          "demographic surveillance|planned and nested studies|",
+          "household follow-up interviews|weekly household visits"
+        )
+      ),
+
+    .groups =
+      "drop"
+  ) %>%
+
+  mutate(
+
+    active_surveillance_detection =
+      ifelse(
+        case_based_passive_sentinel_detection ==
+          "Yes",
+        "No",
+        "Yes"
+      )
+  )
+
+
+assay_flags <-
+  outcome_details %>%
+
+  group_by(
+    cohort_name
+  ) %>%
+
+  summarise(
+
+    assay_serology =
+      flag_detect(
+        `Outcome_assessment_method(specific laboratory methods_or_survey)`,
+        "serology|antibody|igg|igm|neutralization|microneutralization|hemagglutination"
+      ),
+
+    assay_pcr =
+      flag_detect(
+        `Outcome_assessment_method(specific laboratory methods_or_survey)`,
+        "\\bpcr\\b|qpcr|rt-pcr|genexpert|molecular"
+      ),
+
+    assay_microscopy =
+      flag_detect(
+        `Outcome_assessment_method(specific laboratory methods_or_survey)`,
+        "microscopy|blood smear|kato-katz|urine filtration"
+      ),
+
+    assay_culture =
+      flag_detect(
+        `Outcome_assessment_method(specific laboratory methods_or_survey)`,
+        "culture|bactec|microbiological"
+      ),
+
+    assay_elisa =
+      flag_detect(
+        `Outcome_assessment_method(specific laboratory methods_or_survey)`,
+        "elisa"
+      ),
+
+    assay_sequencing =
+      flag_detect(
+        `Outcome_assessment_method(specific laboratory methods_or_survey)`,
+        "sequencing|genotyping|genome-wide|methylation|beadchip|pyrosequencing"
+      ),
+
+    assay_hematology =
+      flag_detect(
+        `Outcome_assessment_method(specific laboratory methods_or_survey)`,
+        "hemoglobin|haemoglobin|full blood count|complete blood count|hemocue"
+      ),
+
+    assay_biomarkers =
+      flag_detect(
+        `Outcome_assessment_method(specific laboratory methods_or_survey)`,
+        "biomarker|cholesterol|creatinine|crp|glucose|hba1c"
+      ),
+
+    assay_anthropometry =
+      flag_detect(
+        `Outcome_assessment_method(specific laboratory methods_or_survey)`,
+        "anthropometr|height|weight|bmi|muac|z-score"
+      ),
+
+    assay_verbal_autopsy =
+      flag_detect(
+        `Outcome_assessment_method(specific laboratory methods_or_survey)`,
+        "verbal autopsy|social autopsy"
+      ),
+
+    assay_questionnaire =
+      flag_detect(
+        `Outcome_assessment_method(specific laboratory methods_or_survey)`,
+        "questionnaire|survey|interview"
+      ),
+
+    assay_rdt =
+      flag_detect(
+        `Outcome_assessment_method(specific laboratory methods_or_survey)`,
+        "rapid diagnostic|rapid test|\\brdt\\b"
+      ),
+
+    assay_imaging =
+      flag_detect(
+        `Outcome_assessment_method(specific laboratory methods_or_survey)`,
+        "radiology|x-ray"
+      ),
+
+    assay_spirometry =
+      flag_detect(
+        `Outcome_assessment_method(specific laboratory methods_or_survey)`,
+        "spirometry|lung function"
+      ),
+
+    .groups =
+      "drop"
+  )
+
+
+biospecimen_flags <-
+  outcome_details %>%
+
+  group_by(
+    cohort_name
+  ) %>%
+
+  summarise(
+
+    sample_blood =
+      flag_detect(
+        Biospecimen,
+        "blood|whole blood|capillary blood|venous blood|finger-prick"
+      ),
+
+    sample_serum =
+      flag_detect(
+        Biospecimen,
+        "serum"
+      ),
+
+    sample_plasma =
+      flag_detect(
+        Biospecimen,
+        "plasma"
+      ),
+
+    sample_dbs =
+      flag_detect(
+        Biospecimen,
+        "dried blood spot"
+      ),
+
+    sample_dna =
+      flag_detect(
+        Biospecimen,
+        "\\bdna\\b"
+      ),
+
+    sample_urine =
+      flag_detect(
+        Biospecimen,
+        "urine"
+      ),
+
+    sample_stool =
+      flag_detect(
+        Biospecimen,
+        "stool|faeces|feces"
+      ),
+
+    sample_sputum =
+      flag_detect(
+        Biospecimen,
+        "sputum|gastric aspirate"
+      ),
+
+    sample_swab =
+      flag_detect(
+        Biospecimen,
+        paste0(
+          "swab|nasal swab|nasopharyngeal|",
+          "oropharyngeal|rectal swab|vaginal swab"
+        )
+      ),
+
+    sample_tissue =
+      flag_detect(
+        Biospecimen,
+        "tissue|biops"
+      ),
+
+    sample_placenta =
+      flag_detect(
+        Biospecimen,
+        "placenta|cord blood|umbilical cord"
+      ),
+
+    sample_saliva =
+      flag_detect(
+        Biospecimen,
+        "saliva"
+      ),
+
+    sample_hair =
+      flag_detect(
+        Biospecimen,
+        "hair"
+      ),
+
+    sample_mosquito =
+      flag_detect(
+        Biospecimen,
+        "mosquito"
+      ),
+
+    sample_animal =
+      flag_detect(
+        Biospecimen,
+        "animal|brain tissue|animal feces"
+      ),
+
+    sample_environmental =
+      flag_detect(
+        Biospecimen,
+        "water|soil|surface|food|hand rinse|toy rinse|air"
+      ),
+
+    .groups =
+      "drop"
+  )
+
+
+human_sampling_flags <-
+  biospecimen_flags %>%
+
+  mutate(
+
+    human_sampling =
+      ifelse(
+
+        sample_blood == "Yes" |
+          sample_serum == "Yes" |
+          sample_plasma == "Yes" |
+          sample_dbs == "Yes" |
+          sample_dna == "Yes" |
+          sample_urine == "Yes" |
+          sample_stool == "Yes" |
+          sample_sputum == "Yes" |
+          sample_swab == "Yes" |
+          sample_tissue == "Yes" |
+          sample_placenta == "Yes" |
+          sample_saliva == "Yes" |
+          sample_hair == "Yes",
+
+        "Yes",
+        "No"
+      )
+  ) %>%
+
+  select(
+    cohort_name,
+    human_sampling
+  )
+```
+
+# 9. Build the cohort-level master dataset
+
+```{r build-cohort-master}
+cohort_info_clean <-
+  cohort_info %>%
+
+  transmute(
+
+    cohort_record_id,
+
+    cohort_name,
+
+    cohort_name_raw,
+
+    country =
+      clean_text(
+        Country
+      ),
+
+    start_year =
+      `Start Year`,
+
+    end_year =
+      `End Year`,
+
+    recruitment_method =
+      clean_text(
+        `Recruitment Method`
+      ),
+
+    contact_details =
+      clean_text(
+        `Contact details`
+      ),
+
+    cohort_link =
+      clean_text(
+        `Link to the cohort`
+      ),
+
+    participant_size =
+      `Sample Size(participants) reported in the cohort website`,
+
+    setting =
+      clean_text(
+        Setting
+      ),
+
+    data_sharing_potential =
+      clean_text(
+        `Data Sharing Potential`
+      ),
+
+    clinical_data_link =
+      clean_text(
+        `Link to Clinical data`
+      ),
+
+    open_future_collaboration =
+      clean_text(
+        `Open for future questions/collaborations`
+      ),
+
+    biobank_samples =
+      clean_text(
+        `Biobank of Samples`
+      ),
+
+    hdss =
+      clean_text(
+        `HDSS?`
+      ),
+
+    mention_one_health =
+      clean_text(
+        `Explicitly mention any One Health Framework?`
+      )
+  )
+
+
+# cohort_info is the reference cohort/site list.
+# left_join prevents additional cohort records
+# from being created during merging.
+
+cohort_master <-
+  cohort_info_clean %>%
+
+  left_join(
+    cohort_domain_flags,
+    by = "cohort_name"
+  ) %>%
+
+  left_join(
+    oh_exposures_cohort,
+    by = "cohort_name"
+  ) %>%
+
+  left_join(
+    oh_outcomes_cohort,
+    by = "cohort_name"
+  ) %>%
+
+  left_join(
+    outcome_list_by_cohort,
+    by = "cohort_name"
+  ) %>%
+
+  left_join(
+    outcome_details_cohort,
+    by = "cohort_name"
+  ) %>%
+
+  left_join(
+    population_flags,
+    by = "cohort_name"
+  ) %>%
+
+  left_join(
+    method_flags,
+    by = "cohort_name"
+  ) %>%
+
+  left_join(
+    assay_flags,
+    by = "cohort_name"
+  ) %>%
+
+  left_join(
+    biospecimen_flags,
+    by = "cohort_name"
+  ) %>%
+
+  left_join(
+    human_sampling_flags,
+    by = "cohort_name"
+  )
+
+
+if (
+  nrow(cohort_master) !=
+    nrow(cohort_info_clean)
+) {
+
+  stop(
+    paste0(
+      "The merge changed the number of cohort/site records. ",
+      "Check duplicate rows in cohort-level lookup tables."
+    )
+  )
+}
+
+
+binary_cols <-
+  unique(
+    c(
+
+      "human_outcome",
+      "animal_exposure_domain",
+      "ecosystem_exposure_domain",
+      "vector_exposure_domain",
+      "socioeconomic_exposure_domain",
+      "other_contextual_exposure_domain",
+
+      "human_sampling",
+
+      "questionnaire_data",
+      "clinical_data",
+      "routine_data",
+      "laboratory_data",
+
+      "case_based_passive_sentinel_detection",
+      "active_surveillance_detection",
+
+      "age_children",
+      "age_adolescents",
+      "age_adults",
+      "age_all_ages",
+
+      "sex_male",
+      "sex_female",
+      "sex_both",
+
+      "special_pregnant",
+      "special_hiv",
+      "special_hospital",
+      "special_deceased",
+      "special_animals",
+
+      "assay_serology",
+      "assay_pcr",
+      "assay_microscopy",
+      "assay_culture",
+      "assay_elisa",
+      "assay_sequencing",
+      "assay_hematology",
+      "assay_biomarkers",
+      "assay_anthropometry",
+      "assay_verbal_autopsy",
+      "assay_questionnaire",
+      "assay_rdt",
+      "assay_imaging",
+      "assay_spirometry",
+
+      "sample_blood",
+      "sample_serum",
+      "sample_plasma",
+      "sample_dbs",
+      "sample_dna",
+      "sample_urine",
+      "sample_stool",
+      "sample_sputum",
+      "sample_swab",
+      "sample_tissue",
+      "sample_placenta",
+      "sample_saliva",
+      "sample_hair",
+      "sample_mosquito",
+      "sample_animal",
+      "sample_environmental",
+
+      outcome_cols_raw,
+
+      all_exposure_cols
+    )
+  )
+
+
+binary_cols <-
+  binary_cols[
+    binary_cols %in%
+      names(cohort_master)
+  ]
+
+
+cohort_master <-
+  cohort_master %>%
+
+  mutate(
+    across(
+      all_of(
+        binary_cols
+      ),
+      force_yesno
+    )
+  ) %>%
+
+  mutate(
+    human_outcome =
+      "Yes"
+  )
+```
+
+# 10. Construct cleaned One Health subdomains and domains
+
+```{r cleaned-one-health-domains}
+human_behaviour_vars <- c(
+
+  "Use of bed nets",
+  "Bushmeat consumption",
+  "Natural water body contact",
+  "Soil contact / geophagy",
+  "Cat contact/ownership",
+  "Dog contact/bites"
+)
+
+
+human_contextual_vars <- c(
+
+  "Socio-economic Indicators",
+  "occupation_animal_related",
+  "occupation_ecosystem_related",
+  "Residency(Rural/Urban)",
+  "Geolocation (GPS)"
+)
+
+
+animal_contact_vars <- c(
+
+  "Wildlife/wildbird Proximity or contact",
+  "Livestock ownership (general)",
+  "Livestock ownership (Pig)",
+  "Poultry/birds Ownership",
+  "Livestock ownership (Goat)",
+  "Livestock ownership (Cattle)",
+  "Livestock ownership (Sheep)",
+  "Small animals",
+  "Bats contact",
+  "Cat contact/ownership",
+  "Dog contact/bites"
+)
+
+
+animal_health_vars <- c(
+
+  "Animal Health Practices(Surveys - Biosecurity, vaccination)",
+  "Antibiotic use in animals",
+  "Dog Vaccination"
+)
+
+
+vector_entomological_vars <- c(
+
+  "Entomological survey - Mosquitoes(densities etc)",
+  "Entomological survey - Ticks"
+)
+
+
+environmental_monitoring_vars <- c(
+
+  "Air pollution(Particulate Matter (PM2.5 or other)",
+  "Climate Variables(Temp.)",
+  "Climate Variables(Humidity)",
+  "Climate Variables(Dryness)",
+  "Climate Variables(Rainfall)"
+)
+
+
+environmental_exposure_vars <- c(
+
+  "Air pollution(Energy Source Cooking)",
+  "Air Pollution(Dust exposure, proximity to Road etc)",
+  "Noise Pollution",
+  "Chemical exposure",
+  "Flooding context",
+  "Natural water body contact",
+  "Water waste management",
+  "Solid waste management",
+  "Soil contact / geophagy",
+  "Greenness",
+  "WASH (Hand washing, saniation, access to clean water)",
+  "WASH(Toilet type)",
+  "Food secutity (nutrition)",
+  "Seasonality"
+)
+
+
+climate_vars <- c(
+
+  "Climate Variables(Temp.)",
+  "Climate Variables(Humidity)",
+  "Climate Variables(Dryness)",
+  "Climate Variables(Rainfall)"
+)
+
+
+cohort_master <-
+  cohort_master %>%
+
+  mutate(
+
+    human_sampling_cleaned =
+      ifelse(
+        human_sampling ==
+          "Yes",
+        "Yes",
+        "No"
+      ),
+
+    human_behaviour_exposure_cleaned =
+      ifelse(
+        yes_count(
+          .,
+          human_behaviour_vars
+        ) > 0,
+        "Yes",
+        "No"
+      ),
+
+    human_contextual_cleaned =
+      ifelse(
+        yes_count(
+          .,
+          human_contextual_vars
+        ) > 0,
+        "Yes",
+        "No"
+      ),
+
+    animal_contact_cleaned =
+      ifelse(
+        yes_count(
+          .,
+          animal_contact_vars
+        ) > 0,
+        "Yes",
+        "No"
+      ),
+
+    animal_sampling_cleaned =
+      ifelse(
+        yes_count(
+          .,
+          c(
+            "Animal Sampling",
+            "sample_animal"
+          )
+        ) > 0,
+        "Yes",
+        "No"
+      ),
+
+    vector_entomological_cleaned =
+      ifelse(
+        yes_count(
+          .,
+          c(
+            vector_entomological_vars,
+            "sample_mosquito"
+          )
+        ) > 0,
+        "Yes",
+        "No"
+      ),
+
+    animal_health_practices_cleaned =
+      ifelse(
+        yes_count(
+          .,
+          animal_health_vars
+        ) > 0,
+        "Yes",
+        "No"
+      ),
+
+    environmental_sampling_cleaned =
+      ifelse(
+        yes_count(
+          .,
+          c(
+            "Other_Environmental sampling",
+            "sample_environmental"
+          )
+        ) > 0,
+        "Yes",
+        "No"
+      ),
+
+    environmental_monitoring_cleaned =
+      ifelse(
+        yes_count(
+          .,
+          environmental_monitoring_vars
+        ) > 0,
+        "Yes",
+        "No"
+      ),
+
+    environmental_exposure_assessment_cleaned =
+      ifelse(
+        yes_count(
+          .,
+          environmental_exposure_vars
+        ) > 0,
+        "Yes",
+        "No"
+      ),
+
+    climate_data_cleaned =
+      ifelse(
+        yes_count(
+          .,
+          climate_vars
+        ) > 0,
+        "Yes",
+        "No"
+      ),
+
+    human_domain_cleaned =
+      ifelse(
+
+        human_sampling_cleaned ==
+          "Yes" |
+
+          human_behaviour_exposure_cleaned ==
+            "Yes" |
+
+          human_contextual_cleaned ==
+            "Yes" |
+
+          human_outcome ==
+            "Yes",
+
+        "Yes",
+        "No"
+      ),
+
+    animal_domain_cleaned =
+      ifelse(
+
+        animal_contact_cleaned ==
+          "Yes" |
+
+          animal_sampling_cleaned ==
+            "Yes" |
+
+          vector_entomological_cleaned ==
+            "Yes" |
+
+          animal_health_practices_cleaned ==
+            "Yes",
+
+        "Yes",
+        "No"
+      ),
+
+    environmental_domain_cleaned =
+      ifelse(
+
+        environmental_sampling_cleaned ==
+          "Yes" |
+
+          environmental_monitoring_cleaned ==
+            "Yes" |
+
+          environmental_exposure_assessment_cleaned ==
+            "Yes" |
+
+          climate_data_cleaned ==
+            "Yes" |
+
+          human_contextual_cleaned ==
+            "Yes",
+
+        "Yes",
+        "No"
+      )
+  )
+
+
+# Final exclusion used in the review.
+
+cohort_master <-
+  cohort_master %>%
+
+  filter(
+    cohort_name !=
+      "SIBS Genomic HDSS"
+  ) %>%
+
+  arrange(
+    cohort_record_id
+  ) %>%
+
+  mutate(
+
+    cohort_id =
+      row_number(),
+
+    broad_interface_cleaned =
+      case_when(
+
+        human_domain_cleaned ==
+          "Yes" &
+
+          animal_domain_cleaned ==
+            "Yes" &
+
+          environmental_domain_cleaned ==
+            "Yes" ~
+
+          "Human-Animal-Environmental",
+
+        human_domain_cleaned ==
+          "Yes" &
+
+          animal_domain_cleaned ==
+            "No" &
+
+          environmental_domain_cleaned ==
+            "Yes" ~
+
+          "Human-Environmental",
+
+        human_domain_cleaned ==
+          "Yes" &
+
+          animal_domain_cleaned ==
+            "Yes" &
+
+          environmental_domain_cleaned ==
+            "No" ~
+
+          "Human-Animal",
+
+        human_domain_cleaned ==
+          "Yes" &
+
+          animal_domain_cleaned ==
+            "No" &
+
+          environmental_domain_cleaned ==
+            "No" ~
+
+          "Human only",
+
+        TRUE ~
+          NA_character_
+      )
+  )
+
+
+cat(
+  "Final cohort records:",
+  nrow(cohort_master),
+  "\n"
+)
+
+
+cat(
+  "Unique cohort IDs:",
+  n_distinct(
+    cohort_master$cohort_id
+  ),
+  "\n"
+)
+
+
+cat(
+  "Unique harmonised cohort names:",
+  n_distinct(
+    cohort_master$cohort_name
+  ),
+  "\n"
+)
+
+
+repeated_cohort_names <-
+  cohort_master %>%
+
+  count(
+    cohort_name,
+    sort = TRUE
+  ) %>%
+
+  filter(
+    n > 1
+  )
+
+
+repeated_cohort_names
+
+
+if (
+  nrow(cohort_master) != 174
+) {
+
+  warning(
+    paste0(
+      "Expected 174 cohort/site records, but found ",
+      nrow(cohort_master),
+      ". Check the source data and exclusions."
+    )
+  )
+}
+
+
+write.csv(
+  cohort_master,
+  "cohort_master_dataset.csv",
+  row.names = FALSE
+)
+```
+
+# 11. Outcome classification
+
+```{r outcome-classification}
+outcome_cols <- c(
+
+  "Malaria",
+  "Tuberculosis",
+  "HIV/AIDS",
+  "Vaccination Coverage",
+  "Demographic trends(births, migrations, pregnancies etc)",
+  "Mortality trends & Causes",
+  "Diarrhea",
+  "Maternal, fertility & Child Health",
+  "Nutrition",
+  "Measles",
+  "Chickenpox",
+  "Rotavirus",
+  "Anaemia",
+  "S. pneumoniae",
+  "Drug Resistance",
+  "Cardiovascular diseases",
+  "Cancers",
+  "Chronic respiratory diseases",
+  "Diabetes",
+  "Mental and neurological disorders",
+  "Musculoskeletal conditions",
+  "Chronic kidney disease",
+  "Acute Respiratory illnesses(ARI)",
+  "Influenza Like Illnesses (ILI)",
+  "Acute Febrile Illnesses (AFI)",
+  "Schistosomiasis",
+  "Filariasis (specifically Lymphatic Filariasis)",
+  "Rabies",
+  "Seasonal Influenza (Flu virus)",
+  "COVID-19 (SARS-CoV-2)",
+  "Respiratory Syncytial Virus (RSV)",
+  "Parainfluenza Virus",
+  "MERS-CoV",
+  "Leptospirosis",
+  "Eye health and vision",
+  "Anthrax",
+  "Plague (Yersinia pestis)",
+  "Toxoplasmosis",
+  "Borrelia",
+  "Bovine tuberculosis (Mycobacterium bovis)",
+  "Campylobacteriosis",
+  "Listeriosis",
+  "Salmonellosis",
+  "Yersiniosis",
+  "Avian influenza (also respiratory but zoonotic)",
+  "Dengue Fever",
+  "Chikungunya",
+  "Zika Virus",
+  "Yellow Fever",
+  "West Nile Virus",
+  "Rift Valley Fever",
+  "Human African Trypanosomiasis (Sleeping Sickness)",
+  "Leishmaniasis",
+  "Tick-borne Encephalitis",
+  "Lyme Disease",
+  "Crimean-Congo Hemorrhagic Fever",
+  "Pertusis",
+  "Dracunculus medinensis",
+  "Acute Illnesses(general)",
+  "soil-transmitted helminths.",
+  "NCDS(General mentioned)",
+  "Hepatitis",
+  "Hypertension",
+  "Clinical Examination(blood pressure, anthropometry)",
+  "dental examination",
+  "Menengitis",
+  "Fasciolosis",
+  "Injuries",
+  "Brucellosis"
+)
+
+
+outcome_lookup <- tibble(
+
+  outcome_name =
+    outcome_cols,
+
+  outcome_category =
+    c(
+
+      "Malaria",
+      "Tuberculosis and mycobacterial diseases",
+      "HIV/AIDS",
+      "Population and prevention",
+      "Population and demographic outcomes",
+      "Population and mortality outcomes",
+      "Food-/water-borne infectious diseases",
+      "Maternal and child health",
+      "Nutrition and anaemia",
+      "Respiratory infectious diseases (non-emerging)",
+      "Other infectious diseases (non-emerging)",
+      "Food-/water-borne infectious diseases",
+      "Nutrition and anaemia",
+      "Respiratory infectious diseases (non-emerging)",
+      "Drug resistance / AMR",
+      "Non-communicable diseases",
+      "Non-communicable diseases",
+      "Non-communicable diseases",
+      "Non-communicable diseases",
+      "Non-communicable diseases",
+      "Non-communicable diseases",
+      "Non-communicable diseases",
+      "Respiratory infectious diseases (non-emerging)",
+      "Respiratory infectious diseases (non-emerging)",
+      "Syndromic / undifferentiated infectious illnesses",
+      "Parasitic / helminthic infectious diseases",
+      "Parasitic / helminthic infectious diseases",
+      "Zoonotic infectious diseases (non-emerging, non-vector-borne)",
+      "Respiratory infectious diseases (non-emerging)",
+      "Emerging / epidemic-prone infectious diseases",
+      "Respiratory infectious diseases (non-emerging)",
+      "Respiratory infectious diseases (non-emerging)",
+      "Emerging / epidemic-prone infectious diseases",
+      "Zoonotic infectious diseases (non-emerging, non-vector-borne)",
+      "Sensory / oral / other health outcomes",
+      "Zoonotic infectious diseases (emerging/epidemic-prone)",
+      "Zoonotic infectious diseases (emerging/epidemic-prone)",
+      "Zoonotic infectious diseases (non-emerging, non-vector-borne)",
+      "Non-malarial vector-borne infectious diseases",
+      "Zoonotic infectious diseases (non-emerging, non-vector-borne)",
+      "Food-/water-borne infectious diseases",
+      "Food-/water-borne infectious diseases",
+      "Food-/water-borne infectious diseases",
+      "Food-/water-borne infectious diseases",
+      "Zoonotic infectious diseases (emerging/epidemic-prone)",
+      "Non-malarial vector-borne infectious diseases",
+      "Non-malarial vector-borne infectious diseases",
+      "Non-malarial vector-borne infectious diseases",
+      "Non-malarial vector-borne infectious diseases",
+      "Non-malarial vector-borne infectious diseases",
+      "Non-malarial vector-borne infectious diseases",
+      "Non-malarial vector-borne infectious diseases",
+      "Non-malarial vector-borne infectious diseases",
+      "Non-malarial vector-borne infectious diseases",
+      "Non-malarial vector-borne infectious diseases",
+      "Non-malarial vector-borne infectious diseases",
+      "Respiratory infectious diseases (non-emerging)",
+      "Parasitic / helminthic infectious diseases",
+      "Syndromic / undifferentiated infectious illnesses",
+      "Parasitic / helminthic infectious diseases",
+      "Non-communicable diseases",
+      "Other infectious diseases (non-emerging)",
+      "Non-communicable diseases",
+      "Clinical / examination / biomarkers",
+      "Sensory / oral / other health outcomes",
+      "Other infectious diseases (non-emerging)",
+      "Zoonotic infectious diseases (non-emerging, non-vector-borne)",
+      "Injuries / trauma",
+      "Zoonotic infectious diseases (non-emerging, non-vector-borne)"
+    )
+)
+
+
+infectious_categories <- c(
+
+  "Malaria",
+  "Tuberculosis and mycobacterial diseases",
+  "HIV/AIDS",
+  "Respiratory infectious diseases (non-emerging)",
+  "Zoonotic infectious diseases (non-emerging, non-vector-borne)",
+  "Zoonotic infectious diseases (emerging/epidemic-prone)",
+  "Food-/water-borne infectious diseases",
+  "Parasitic / helminthic infectious diseases",
+  "Non-malarial vector-borne infectious diseases",
+  "Emerging / epidemic-prone infectious diseases",
+  "Syndromic / undifferentiated infectious illnesses",
+  "Other infectious diseases (non-emerging)",
+  "Drug resistance / AMR"
+)
+```
+
+# 12. Clean cohort characteristics
+
+```{r cohort-characteristics}
+cohort_clean <-
+  cohort_master %>%
+
+  mutate(
+
+    cohort_name =
+      clean_text(
+        cohort_name
+      ),
+
+    country_raw =
+      clean_text(
+        country
+      ),
+
+    country_clean =
+      clean_text(
+        country
+      ),
+
+    country_type =
+      clean_country_type(
+        country_clean
+      ),
+
+    region =
+      classify_region(
+        country_clean
+      ),
+
+    participant_size_raw =
+      clean_text(
+        participant_size
+      ),
+
+    participant_size_n =
+      map_dbl(
+        participant_size_raw,
+        extract_sample_size_numeric
+      ),
+
+    participant_size_cat =
+      categorise_sample_size(
+        participant_size_n
+      ),
+
+    setting_raw =
+      clean_text(
+        setting
+      ),
+
+    setting_clean =
+      clean_setting(
+        setting
+      ),
+
+    start_year_num =
+      suppressWarnings(
+        as.numeric(
+          clean_text(
+            start_year
+          )
+        )
+      ),
+
+    start_decade =
+      categorise_decade(
+        start_year_num
+      ),
+
+    end_year_num =
+      suppressWarnings(
+        as.numeric(
+          clean_text(
+            end_year
+          )
+        )
+      ),
+
+    cohort_status =
+      categorise_status(
+        end_year_num
+      ),
+
+    hdss_clean =
+      case_when(
+
+        is_yes(hdss) ~
+          "HDSS",
+
+        !is.na(hdss) &
+          clean_text(hdss) != "" ~
+          "Non-HDSS",
+
+        TRUE ~
+          "Unclear"
+      ),
+
+    one_health_clean =
+      case_when(
+
+        is_yes(
+          mention_one_health
+        ) ~
+          "Mentions One Health",
+
+        !is.na(
+          mention_one_health
+        ) &
+
+          clean_text(
+            mention_one_health
+          ) != "" ~
+
+          "Does not mention One Health",
+
+        TRUE ~
+          "Unclear"
+      ),
+
+    data_sharing_clean =
+      case_when(
+
+        str_detect(
+          tolower(
+            clean_text(
+              data_sharing_potential
+            )
+          ),
+          paste0(
+            "yes|available|open|request|",
+            "upon request|application"
+          )
+        ) ~
+          "Potentially shareable",
+
+        str_detect(
+          tolower(
+            clean_text(
+              data_sharing_potential
+            )
+          ),
+          "no|restricted|not available|not shared"
+        ) ~
+          "Restricted/not shareable",
+
+        TRUE ~
+          "Unclear"
+      ),
+
+    age_category_clean2 =
+      case_when(
+
+        is_yes(
+          age_all_ages
+        ) ~
+          "All ages",
+
+        is_yes(
+          age_children
+        ) &
+          is_yes(
+            age_adults
+          ) ~
+          "All ages",
+
+        is_yes(
+          age_adolescents
+        ) &
+          !is_yes(
+            age_adults
+          ) &
+          !is_yes(
+            age_children
+          ) ~
+          "Children only",
+
+        is_yes(
+          age_children
+        ) &
+          !is_yes(
+            age_adults
+          ) ~
+          "Children only",
+
+        !is_yes(
+          age_children
+        ) &
+          !is_yes(
+            age_adolescents
+          ) &
+          is_yes(
+            age_adults
+          ) ~
+          "Adults only",
+
+        TRUE ~
+          NA_character_
+      ),
+
+    sex_gender_clean2 =
+      case_when(
+
+        is_yes(
+          sex_both
+        ) ~
+          "Both sexes",
+
+        is_yes(
+          sex_female
+        ) &
+          !is_yes(
+            sex_male
+          ) ~
+          "Female only",
+
+        is_yes(
+          sex_male
+        ) &
+          !is_yes(
+            sex_female
+          ) ~
+          "Male only",
+
+        is_yes(
+          sex_male
+        ) &
+          is_yes(
+            sex_female
+          ) ~
+          "Both sexes",
+
+        TRUE ~
+          NA_character_
+      )
+  )
+
+
+cat(
+  "Rows in cohort_clean:",
+  nrow(cohort_clean),
+  "\n"
+)
+
+
+cat(
+  "Unique cohort_id:",
+  n_distinct(
+    cohort_clean$cohort_id
+  ),
+  "\n"
+)
+
+
+cat(
+  "Unique cohort_name:",
+  n_distinct(
+    cohort_clean$cohort_name
+  ),
+  "\n"
+)
+
+
+cohort_clean %>%
+
+  count(
+    cohort_name,
+    sort = TRUE
+  ) %>%
+
+  filter(
+    n > 1
+  )
+```
+
+# 13. Long outcome dataset and follow-up
+
+```{r outcome-long-followup}
+outcome_cols_present <-
+  intersect(
+    outcome_cols,
+    names(cohort_clean)
+  )
+
+
+outcome_long_clean <-
+  cohort_clean %>%
+
+  select(
+    cohort_id,
+    cohort_name,
+    all_of(
+      outcome_cols_present
+    )
+  ) %>%
+
+  pivot_longer(
+
+    cols =
+      all_of(
+        outcome_cols_present
+      ),
+
+    names_to =
+      "outcome_name",
+
+    values_to =
+      "outcome_value_raw"
+  ) %>%
+
+  mutate(
+
+    outcome_present =
+      is_yes(
+        outcome_value_raw
+      )
+  ) %>%
+
+  filter(
+    outcome_present
+  ) %>%
+
+  left_join(
+    outcome_lookup,
+    by = "outcome_name"
+  ) %>%
+
+  mutate(
+
+    outcome_category =
+      if_else(
+        is.na(
+          outcome_category
+        ),
+        "Other/unclear",
+        outcome_category
+      ),
+
+    broad_outcome_domain =
+      case_when(
+
+        outcome_category %in%
+          infectious_categories ~
+          "Infectious disease",
+
+        outcome_category ==
+          "Non-communicable diseases" ~
+          "Non-communicable diseases",
+
+        outcome_category %in%
+          c(
+            "Population and prevention",
+            "Population and demographic outcomes",
+            "Population and mortality outcomes",
+            "Maternal and child health",
+            "Nutrition and anaemia"
+          ) ~
+          "Population / prevention / nutrition",
+
+        outcome_category ==
+          "Clinical / examination / biomarkers" ~
+          "Clinical / examination",
+
+        outcome_category %in%
+          c(
+            "Sensory / oral / other health outcomes",
+            "Injuries / trauma"
+          ) ~
+          "Other health outcomes",
+
+        TRUE ~
+          "Other/unclear"
+      )
+  )
+
+
+outcome_by_cohort <-
+  outcome_long_clean %>%
+
+  distinct(
+    cohort_id,
+    outcome_name,
+    outcome_category
+  ) %>%
+
+  group_by(
+    cohort_id
+  ) %>%
+
+  summarise(
+
+    outcome_categories_clean =
+      paste(
+        sort(
+          unique(
+            outcome_category
+          )
+        ),
+        collapse = "; "
+      ),
+
+    n_outcome_categories =
+      n_distinct(
+        outcome_category
+      ),
+
+    individual_outcomes_clean =
+      paste(
+        sort(
+          unique(
+            outcome_name
+          )
+        ),
+        collapse = "; "
+      ),
+
+    n_individual_outcomes =
+      n_distinct(
+        outcome_name
+      ),
+
+    .groups =
+      "drop"
+  )
+
+
+outcome_domain_by_cohort <-
+  outcome_long_clean %>%
+
+  distinct(
+    cohort_id,
+    broad_outcome_domain
+  ) %>%
+
+  group_by(
+    cohort_id
+  ) %>%
+
+  summarise(
+
+    broad_outcome_domains =
+      paste(
+        sort(
+          unique(
+            broad_outcome_domain
+          )
+        ),
+        collapse = "; "
+      ),
+
+    .groups =
+      "drop"
+  )
+
+
+outcome_details_clean <-
+  outcome_details %>%
+
+  mutate(
+
+    cohort_name =
+      clean_text(
+        cohort_name
+      ),
+
+    Outcome =
+      clean_text(
+        Outcome
+      ),
+
+    followup_raw =
+      `Follow Up  (Months -for specific outcome)`,
+
+    followup_raw_clean =
+      clean_text(
+        followup_raw
+      ),
+
+    followup_months =
+      map_dbl(
+        followup_raw,
+        parse_followup_months
+      )
+  )
+
+
+# Follow-up information was extracted at the
+# harmonised cohort-name level. Jointly reported
+# cohort sites therefore receive the same
+# source-level follow-up information.
+
+followup_by_name <-
+  outcome_details_clean %>%
+
+  group_by(
+    cohort_name
+  ) %>%
+
+  summarise(
+
+    n_outcome_followup_records =
+      sum(
+        !is.na(
+          followup_months
+        )
+      ),
+
+    followup_min_months =
+      ifelse(
+
+        n_outcome_followup_records >
+          0,
+
+        min(
+          followup_months,
+          na.rm = TRUE
+        ),
+
+        NA_real_
+      ),
+
+    followup_max_months =
+      ifelse(
+
+        n_outcome_followup_records >
+          0,
+
+        max(
+          followup_months,
+          na.rm = TRUE
+        ),
+
+        NA_real_
+      ),
+
+    n_distinct_followup_values =
+      n_distinct(
+        followup_months[
+          !is.na(
+            followup_months
+          )
+        ]
+      ),
+
+    .groups =
+      "drop"
+  ) %>%
+
+  mutate(
+
+    followup_range_cat =
+      categorise_followup_range(
+        followup_min_months,
+        followup_max_months
+      ),
+
+    followup_midpoint_months =
+      ifelse(
+
+        !is.na(
+          followup_min_months
+        ) &
+          !is.na(
+            followup_max_months
+          ),
+
+        (
+          followup_min_months +
+            followup_max_months
+        ) / 2,
+
+        NA_real_
+      )
+  )
+
+
+cohort_characteristics <-
+  cohort_clean %>%
+
+  left_join(
+    outcome_by_cohort,
+    by = "cohort_id"
+  ) %>%
+
+  left_join(
+    outcome_domain_by_cohort,
+    by = "cohort_id"
+  ) %>%
+
+  left_join(
+    followup_by_name,
+    by = "cohort_name"
+  )
+```
+
+# 14. Descriptive cohort-characteristics tables
+
+```{r descriptive-tables}
+table_region <-
+  summ_cat(
+    cohort_characteristics,
+    region
+  ) %>%
+
+  mutate(
+    variable =
+      "Region"
+  )
+
+
+table_country_type <-
+  summ_cat(
+    cohort_characteristics,
+    country_type
+  ) %>%
+
+  mutate(
+    variable =
+      "Country classification"
+  )
+
+
+table_sample_size <-
+  summ_cat(
+    cohort_characteristics,
+    participant_size_cat
+  ) %>%
+
+  mutate(
+    variable =
+      "Participant size"
+  )
+
+
+table_start_decade <-
+  summ_cat(
+    cohort_characteristics,
+    start_decade
+  ) %>%
+
+  mutate(
+    variable =
+      "Start decade"
+  )
+
+
+table_status <-
+  summ_cat(
+    cohort_characteristics,
+    cohort_status
+  ) %>%
+
+  mutate(
+    variable =
+      "Cohort status"
+  )
+
+
+table_setting <-
+  summ_cat(
+    cohort_characteristics,
+    setting_clean
+  ) %>%
+
+  mutate(
+    variable =
+      "Setting"
+  )
+
+
+table_data_sharing <-
+  summ_cat(
+    cohort_characteristics,
+    data_sharing_clean
+  ) %>%
+
+  mutate(
+    variable =
+      "Data sharing potential"
+  )
+
+
+table_hdss <-
+  summ_cat(
+    cohort_characteristics,
+    hdss_clean
+  ) %>%
+
+  mutate(
+    variable =
+      "HDSS status"
+  )
+
+
+table_one_health <-
+  summ_cat(
+    cohort_characteristics,
+    one_health_clean
+  ) %>%
+
+  mutate(
+    variable =
+      "One Health mention"
+  )
+
+
+table_age <-
+  summ_cat(
+    cohort_characteristics,
+    age_category_clean2
+  ) %>%
+
+  mutate(
+    variable =
+      "Age category"
+  )
+
+
+table_sex <-
+  summ_cat(
+    cohort_characteristics,
+    sex_gender_clean2
+  ) %>%
+
+  mutate(
+    variable =
+      "Sex/gender category"
+  )
+
+
+table_interface <-
+  summ_cat(
+    cohort_characteristics,
+    broad_interface_cleaned
+  ) %>%
+
+  mutate(
+    variable =
+      "Broad One Health interface"
+  )
+
+
+table_followup <-
+  summ_cat(
+    cohort_characteristics,
+    followup_range_cat
+  ) %>%
+
+  mutate(
+    variable =
+      "Follow-up range"
+  )
+
+
+cohort_characteristics_table <-
+  bind_rows(
+
+    table_region,
+    table_country_type,
+    table_sample_size,
+    table_start_decade,
+    table_status,
+    table_setting,
+    table_data_sharing,
+    table_hdss,
+    table_one_health,
+    table_age,
+    table_sex,
+    table_interface,
+    table_followup
+  ) %>%
+
+  mutate(
+
+    category =
+      as.character(
+        category
+      ),
+
+    `n (%)` =
+      paste0(
+        n,
+        " (",
+        percent,
+        ")"
+      )
+  ) %>%
+
+  select(
+    variable,
+    category,
+    `n (%)`
+  )
+
+
+cohort_characteristics_table_ft <-
+  cohort_characteristics_table %>%
+
+  group_by(
+    variable
+  ) %>%
+
+  mutate(
+
+    variable_display =
+      if_else(
+        row_number() == 1,
+        variable,
+        ""
+      )
+  ) %>%
+
+  ungroup() %>%
+
+  select(
+
+    Characteristic =
+      variable_display,
+
+    Category =
+      category,
+
+    `No. of cohorts (%)` =
+      `n (%)`
+  )
+
+
+ft_cohort_characteristics <-
+  flextable(
+    cohort_characteristics_table_ft
+  ) %>%
+
+  theme_booktabs() %>%
+
+  autofit() %>%
+
+  bold(
+    part = "header"
+  ) %>%
+
+  align(
+    j = 1:2,
+    align = "left",
+    part = "all"
+  ) %>%
+
+  align(
+    j = 3,
+    align = "center",
+    part = "all"
+  ) %>%
+
+  fontsize(
+    size = 10,
+    part = "all"
+  ) %>%
+
+  set_caption(
+    "Table. Summary characteristics of included cohorts"
+  )
+
+
+ft_cohort_characteristics
+
+
+method_summary <- tibble(
+
+  Method =
+    c(
+      "Active surveillance",
+      "Passive/sentinel surveillance",
+      "Questionnaire/survey",
+      "Clinical assessment",
+      "Laboratory assessment",
+      "Routine/registry data"
+    ),
+
+  n =
+    c(
+
+      sum(
+        cohort_clean$active_surveillance_detection ==
+          "Yes",
+        na.rm = TRUE
+      ),
+
+      sum(
+        cohort_clean$case_based_passive_sentinel_detection ==
+          "Yes",
+        na.rm = TRUE
+      ),
+
+      sum(
+        cohort_clean$questionnaire_data ==
+          "Yes",
+        na.rm = TRUE
+      ),
+
+      sum(
+        cohort_clean$clinical_data ==
+          "Yes",
+        na.rm = TRUE
+      ),
+
+      sum(
+        cohort_clean$laboratory_data ==
+          "Yes",
+        na.rm = TRUE
+      ),
+
+      sum(
+        cohort_clean$routine_data ==
+          "Yes",
+        na.rm = TRUE
+      )
+    )
+) %>%
+
+  mutate(
+
+    percent =
+      round(
+        100 *
+          n /
+          nrow(cohort_clean),
+        1
+      )
+  )
+
+
+method_summary
+```
+
+# 15. Broad One Health interface figure
+
+```{r interface-figure, fig.width=8, fig.height=4.5}
+interface_summary <-
+  cohort_clean %>%
+
+  filter(
+    broad_interface_cleaned %in%
+      c(
+        "Human-Environmental",
+        "Human-Animal-Environmental"
+      )
+  ) %>%
+
+  count(
+    broad_interface_cleaned,
+    name =
+      "n_cohorts"
+  ) %>%
+
+  mutate(
+
+    proportion =
+      n_cohorts /
+        nrow(cohort_clean),
+
+    label =
+      percent(
+        proportion,
+        accuracy = 0.1
+      )
+  )
+
+
+p_interface <-
+  ggplot(
+
+    interface_summary,
+
+    aes(
+
+      x =
+        proportion,
+
+      y =
+        fct_reorder(
+          broad_interface_cleaned,
+          proportion
+        )
+    )
+  ) +
+
+  geom_col(
+    fill = "#08306b",
+    width = 0.7
+  ) +
+
+  geom_text(
+
+    aes(
+      label =
+        label
+    ),
+
+    hjust = -0.08,
+    size = 4.5
+  ) +
+
+  scale_x_continuous(
+
+    labels =
+      percent_format(
+        accuracy = 1
+      ),
+
+    limits =
+      c(
+        0,
+        max(
+          interface_summary$proportion
+        ) * 1.15
+      ),
+
+    expand =
+      expansion(
+        mult = c(
+          0,
+          0.02
+        )
+      )
+  ) +
+
+  labs(
+    x =
+      "Proportion of cohorts",
+    y =
+      NULL
+  ) +
+
+  theme_minimal(
+    base_size = 13
+  ) +
+
+  theme(
+    panel.grid.major.y =
+      element_blank(),
+    panel.grid.minor =
+      element_blank()
+  )
+
+
+p_interface
+```
+
+# 16. Individual outcomes, infectious outcomes, assays and human sample types
+
+```{r outcome-assay-sample-summaries}
+col_dark_blue <-
+  "#004B7A"
+
+col_mid_blue <-
+  "#3B8BC2"
+
+col_light_blue <-
+  "#9CCBEA"
+
+col_dark_red <-
+  "#B30000"
+
+
+n_total_cohorts <-
+  n_distinct(
+    cohort_clean$cohort_id
+  )
+
+
+outcomes_plot <-
+  outcome_long_clean %>%
+
+  mutate(
+
+    outcome_name_plot =
+      case_when(
+
+        outcome_name ==
+          "Pertusis" ~
+          "Pertussis",
+
+        outcome_name ==
+          "Menengitis" ~
+          "Meningitis",
+
+        outcome_name ==
+          "soil-transmitted helminths." ~
+          "Soil-transmitted helminths",
+
+        TRUE ~
+          outcome_name
+      )
+  )
+
+
+individual_outcome_counts <-
+  outcomes_plot %>%
+
+  distinct(
+    cohort_id,
+    outcome_name_plot
+  ) %>%
+
+  count(
+    outcome_name_plot,
+    name =
+      "n_cohorts"
+  ) %>%
+
+  mutate(
+
+    proportion =
+      n_cohorts /
+        n_total_cohorts,
+
+    percent =
+      100 *
+        proportion
+  ) %>%
+
+  arrange(
+    desc(
+      proportion
+    )
+  )
+
+
+infectious_outcome_counts <-
+  outcomes_plot %>%
+
+  filter(
+    outcome_category %in%
+      infectious_categories
+  ) %>%
+
+  distinct(
+    cohort_id,
+    outcome_name_plot
+  ) %>%
+
+  count(
+    outcome_name_plot,
+    name =
+      "n_cohorts"
+  ) %>%
+
+  mutate(
+
+    proportion =
+      n_cohorts /
+        n_total_cohorts,
+
+    percent =
+      100 *
+        proportion
+  ) %>%
+
+  arrange(
+    desc(
+      proportion
+    )
+  )
+
+
+missing_from_red <-
+  outcomes_plot %>%
+
+  filter(
+    outcome_category %in%
+      infectious_categories
+  ) %>%
+
+  distinct(
+    outcome_name_plot
+  ) %>%
+
+  anti_join(
+
+    infectious_outcome_counts %>%
+      select(
+        outcome_name_plot
+      ),
+
+    by =
+      "outcome_name_plot"
+  )
+
+
+cat(
+  "Infectious outcomes missing from red graph:",
+  nrow(missing_from_red),
+  "\n"
+)
+
+
+assay_long <-
+  cohort_clean %>%
+
+  select(
+
+    cohort_id,
+
+    assay_serology,
+    assay_pcr,
+    assay_microscopy,
+    assay_culture,
+    assay_elisa,
+    assay_sequencing,
+    assay_hematology,
+    assay_biomarkers,
+    assay_anthropometry,
+    assay_verbal_autopsy,
+    assay_questionnaire,
+    assay_rdt,
+    assay_imaging,
+    assay_spirometry
+  ) %>%
+
+  pivot_longer(
+
+    cols =
+      -cohort_id,
+
+    names_to =
+      "assay_var",
+
+    values_to =
+      "assessed"
+  ) %>%
+
+  filter(
+    is_yes(
+      assessed
+    )
+  ) %>%
+
+  mutate(
+
+    assay =
+      recode(
+
+        assay_var,
+
+        assay_serology =
+          "Serology",
+
+        assay_pcr =
+          "PCR",
+
+        assay_microscopy =
+          "Microscopy",
+
+        assay_culture =
+          "Culture",
+
+        assay_elisa =
+          "ELISA",
+
+        assay_sequencing =
+          "Sequencing",
+
+        assay_hematology =
+          "Hematology",
+
+        assay_biomarkers =
+          "Biomarkers",
+
+        assay_anthropometry =
+          "Anthropometry",
+
+        assay_verbal_autopsy =
+          "Verbal autopsy",
+
+        assay_questionnaire =
+          "Questionnaire",
+
+        assay_rdt =
+          "Rapid diagnostic test",
+
+        assay_imaging =
+          "Imaging",
+
+        assay_spirometry =
+          "Spirometry"
+      )
+  )
+
+
+assay_counts <-
+  assay_long %>%
+
+  distinct(
+    cohort_id,
+    assay
+  ) %>%
+
+  count(
+    assay,
+    name =
+      "n_cohorts"
+  ) %>%
+
+  mutate(
+
+    proportion =
+      n_cohorts /
+        n_total_cohorts,
+
+    percent =
+      100 *
+        proportion
+  ) %>%
+
+  arrange(
+    desc(
+      proportion
+    )
+  )
+
+
+sample_long_human <-
+  cohort_clean %>%
+
+  select(
+
+    cohort_id,
+
+    sample_blood,
+    sample_serum,
+    sample_plasma,
+    sample_dbs,
+    sample_urine,
+    sample_stool,
+    sample_sputum,
+    sample_swab,
+    sample_tissue,
+    sample_placenta,
+    sample_saliva,
+    sample_hair
+  ) %>%
+
+  pivot_longer(
+
+    cols =
+      -cohort_id,
+
+    names_to =
+      "sample_var",
+
+    values_to =
+      "assessed"
+  ) %>%
+
+  filter(
+    is_yes(
+      assessed
+    )
+  ) %>%
+
+  mutate(
+
+    sample_type =
+      recode(
+
+        sample_var,
+
+        sample_blood =
+          "Blood",
+
+        sample_serum =
+          "Serum",
+
+        sample_plasma =
+          "Plasma",
+
+        sample_dbs =
+          "DBS",
+
+        sample_urine =
+          "Urine",
+
+        sample_stool =
+          "Stool",
+
+        sample_sputum =
+          "Sputum",
+
+        sample_swab =
+          "Swab",
+
+        sample_tissue =
+          "Tissue",
+
+        sample_placenta =
+          "Placenta",
+
+        sample_saliva =
+          "Saliva",
+
+        sample_hair =
+          "Hair"
+      )
+  )
+
+
+sample_counts_human <-
+  sample_long_human %>%
+
+  distinct(
+    cohort_id,
+    sample_type
+  ) %>%
+
+  count(
+    sample_type,
+    name =
+      "n_cohorts"
+  ) %>%
+
+  mutate(
+
+    proportion =
+      n_cohorts /
+        n_total_cohorts,
+
+    percent =
+      100 *
+        proportion
+  ) %>%
+
+  arrange(
+    desc(
+      proportion
+    )
+  )
+```
+
+```{r outcome-figures, fig.width=11, fig.height=8}
+p_individual_outcomes <-
+  ggplot(
+
+    individual_outcome_counts,
+
+    aes(
+
+      x =
+        proportion,
+
+      y =
+        fct_reorder(
+          outcome_name_plot,
+          proportion
+        )
+    )
+  ) +
+
+  geom_col(
+    fill =
+      col_light_blue,
+    width =
+      0.72
+  ) +
+
+  geom_text(
+
+    aes(
+      label =
+        percent_format(
+          accuracy = 0.1
+        )(
+          proportion
+        )
+    ),
+
+    hjust =
+      -0.08,
+
+    size =
+      3.8
+  ) +
+
+  scale_x_continuous(
+
+    labels =
+      percent_format(
+        accuracy = 1
+      ),
+
+    limits =
+      c(
+        0,
+        max(
+          individual_outcome_counts$proportion
+        ) * 1.18
+      ),
+
+    expand =
+      expansion(
+        mult =
+          c(
+            0,
+            0.02
+          )
+      )
+  ) +
+
+  labs(
+
+    x =
+      "Proportion of cohorts",
+
+    y =
+      NULL
+  ) +
+
+  theme_minimal(
+    base_size = 12
+  ) +
+
+  theme(
+
+    panel.grid.major.y =
+      element_blank(),
+
+    panel.grid.minor =
+      element_blank()
+  )
+
+
+p_individual_outcomes
+```
+
+```{r infectious-outcome-figure, fig.width=12, fig.height=8}
+p_infectious_outcomes <-
+  ggplot(
+
+    infectious_outcome_counts,
+
+    aes(
+
+      x =
+        proportion,
+
+      y =
+        fct_reorder(
+          outcome_name_plot,
+          proportion
+        )
+    )
+  ) +
+
+  geom_col(
+
+    fill =
+      col_dark_red,
+
+    width =
+      0.72
+  ) +
+
+  geom_text(
+
+    aes(
+      label =
+        percent_format(
+          accuracy = 0.1
+        )(
+          proportion
+        )
+    ),
+
+    hjust =
+      -0.08,
+
+    size =
+      3.8
+  ) +
+
+  scale_x_continuous(
+
+    labels =
+      percent_format(
+        accuracy = 1
+      ),
+
+    limits =
+      c(
+        0,
+        max(
+          infectious_outcome_counts$proportion
+        ) * 1.18
+      ),
+
+    expand =
+      expansion(
+        mult =
+          c(
+            0,
+            0.02
+          )
+      )
+  ) +
+
+  labs(
+
+    x =
+      "Proportion of cohorts",
+
+    y =
+      NULL
+  ) +
+
+  theme_minimal(
+    base_size = 12
+  ) +
+
+  theme(
+
+    panel.grid.major.y =
+      element_blank(),
+
+    panel.grid.minor =
+      element_blank()
+  )
+
+
+p_infectious_outcomes
+```
+
+```{r assay-sample-figures, fig.width=9, fig.height=6}
+p_assays <-
+  ggplot(
+
+    assay_counts,
+
+    aes(
+
+      x =
+        proportion,
+
+      y =
+        fct_reorder(
+          assay,
+          proportion
+        )
+    )
+  ) +
+
+  geom_col(
+
+    fill =
+      col_light_blue,
+
+    width =
+      0.72
+  ) +
+
+  geom_text(
+
+    aes(
+      label =
+        percent_format(
+          accuracy = 0.1
+        )(
+          proportion
+        )
+    ),
+
+    hjust =
+      -0.08,
+
+    size =
+      4
+  ) +
+
+  scale_x_continuous(
+
+    labels =
+      percent_format(
+        accuracy = 1
+      ),
+
+    limits =
+      c(
+        0,
+        max(
+          assay_counts$proportion
+        ) * 1.18
+      )
+  ) +
+
+  labs(
+    x =
+      "Proportion of cohorts",
+    y =
+      NULL
+  ) +
+
+  theme_minimal(
+    base_size = 12
+  ) +
+
+  theme(
+    panel.grid.major.y =
+      element_blank()
+  )
+
+
+p_sample_types_human <-
+  ggplot(
+
+    sample_counts_human,
+
+    aes(
+
+      x =
+        proportion,
+
+      y =
+        fct_reorder(
+          sample_type,
+          proportion
+        )
+    )
+  ) +
+
+  geom_col(
+
+    fill =
+      col_mid_blue,
+
+    width =
+      0.72
+  ) +
+
+  geom_text(
+
+    aes(
+      label =
+        percent_format(
+          accuracy = 0.1
+        )(
+          proportion
+        )
+    ),
+
+    hjust =
+      -0.08,
+
+    size =
+      4
+  ) +
+
+  scale_x_continuous(
+
+    labels =
+      percent_format(
+        accuracy = 1
+      ),
+
+    limits =
+      c(
+        0,
+        max(
+          sample_counts_human$proportion
+        ) * 1.18
+      )
+  ) +
+
+  labs(
+    x =
+      "Proportion of cohorts",
+    y =
+      NULL
+  ) +
+
+  theme_minimal(
+    base_size = 12
+  ) +
+
+  theme(
+    panel.grid.major.y =
+      element_blank()
+  )
+
+
+p_assays
+
+p_sample_types_human
+```
+
+# 17. Data-integration matrix and score
+
+```{r integration-matrix}
+integration_scored <-
+  cohort_clean %>%
+
+  mutate(
+
+    A_human_domain =
+      human_outcome ==
+        "Yes",
+
+    B_animal_domain =
+      animal_domain_cleaned ==
+        "Yes",
+
+    C_environment_domain =
+      environmental_domain_cleaned ==
+        "Yes",
+
+    D_human_sampling =
+      human_sampling_cleaned ==
+        "Yes",
+
+    E_animal_sampling =
+      animal_sampling_cleaned ==
+        "Yes",
+
+    F_environment_sampling =
+      environmental_sampling_cleaned ==
+        "Yes" |
+
+        environmental_monitoring_cleaned ==
+          "Yes",
+
+    G_climate_data =
+      climate_data_cleaned ==
+        "Yes",
+
+    H_questionnaire =
+      questionnaire_data ==
+        "Yes",
+
+    I_clinical =
+      clinical_data ==
+        "Yes",
+
+    J_laboratory =
+      laboratory_data ==
+        "Yes",
+
+    K_biobanking =
+      !is.na(
+        biobank_samples
+      ) &
+
+        !tolower(
+          trimws(
+            as.character(
+              biobank_samples
+            )
+          )
+        ) %in%
+        c(
+          "",
+          "no",
+          "n",
+          "none",
+          "none reported",
+          "not reported",
+          "not specified",
+          "na",
+          "n/a"
+        ),
+
+    L_registry =
+      routine_data ==
+        "Yes" |
+
+        tolower(
+          as.character(
+            hdss
+          )
+        ) %in%
+        c(
+          "yes",
+          "y",
+          "true",
+          "1"
+        ),
+
+    M_passive_detection =
+      case_based_passive_sentinel_detection ==
+        "Yes",
+
+    N_verbal_autopsy =
+      assay_verbal_autopsy ==
+        "Yes" |
+
+        special_deceased ==
+          "Yes",
+
+    O_active_surveillance =
+      active_surveillance_detection ==
+        "Yes",
+
+    P_gis =
+      `Geolocation (GPS)` ==
+        "Yes"
+  ) %>%
+
+  mutate(
+
+    data_integration_score =
+      rowSums(
+
+        cbind(
+
+          A_human_domain,
+          B_animal_domain,
+          C_environment_domain,
+          D_human_sampling,
+          E_animal_sampling,
+          F_environment_sampling,
+          G_climate_data,
+          H_questionnaire,
+          I_clinical,
+          J_laboratory,
+          K_biobanking,
+          L_registry,
+          M_passive_detection,
+          N_verbal_autopsy,
+          O_active_surveillance,
+          P_gis
+        ),
+
+        na.rm = TRUE
+      )
+  )
+
+
+integration_data <-
+  integration_scored %>%
+
+  select(
+
+    A_human_domain,
+    B_animal_domain,
+    C_environment_domain,
+    D_human_sampling,
+    E_animal_sampling,
+    F_environment_sampling,
+    G_climate_data,
+    H_questionnaire,
+    I_clinical,
+    J_laboratory,
+    K_biobanking,
+    L_registry,
+    M_passive_detection,
+    N_verbal_autopsy,
+    O_active_surveillance,
+    P_gis
+  )
+
+
+integration_matrix <-
+  matrix(
+
+    0,
+
+    nrow =
+      ncol(
+        integration_data
+      ),
+
+    ncol =
+      ncol(
+        integration_data
+      ),
+
+    dimnames =
+      list(
+        names(
+          integration_data
+        ),
+        names(
+          integration_data
+        )
+      )
+  )
+
+
+for (
+  i in seq_len(
+    ncol(
+      integration_data
+    )
+  )
+) {
+
+  for (
+    j in seq_len(
+      ncol(
+        integration_data
+      )
+    )
+  ) {
+
+    integration_matrix[
+      i,
+      j
+    ] <-
+
+      sum(
+
+        integration_data[[i]] &
+          integration_data[[j]],
+
+        na.rm =
+          TRUE
+      )
+  }
+}
+
+
+data_type_labels <- c(
+
+  A_human_domain =
+    "Human domain",
+
+  B_animal_domain =
+    "Animal domain",
+
+  C_environment_domain =
+    "Environmental domain",
+
+  D_human_sampling =
+    "Human biospecimen\nsampling",
+
+  E_animal_sampling =
+    "Animal sampling",
+
+  F_environment_sampling =
+    "Environmental sampling/\nmonitoring",
+
+  G_climate_data =
+    "Climate data",
+
+  H_questionnaire =
+    "Questionnaire/\nsurvey",
+
+  I_clinical =
+    "Clinical examination",
+
+  J_laboratory =
+    "Laboratory analysis",
+
+  K_biobanking =
+    "Biobanking",
+
+  L_registry =
+    "Registry/routine",
+
+  M_passive_detection =
+    "Passive surveillance",
+
+  N_verbal_autopsy =
+    "Verbal autopsy",
+
+  O_active_surveillance =
+    "Active surveillance",
+
+  P_gis =
+    "GIS/spatial data"
+)
+
+
+matrix_long <-
+  as.data.frame(
+    integration_matrix
+  ) %>%
+
+  rownames_to_column(
+    "row_type"
+  ) %>%
+
+  pivot_longer(
+
+    cols =
+      -row_type,
+
+    names_to =
+      "col_type",
+
+    values_to =
+      "count"
+  )
+
+
+row_denominators <-
+  diag(
+    integration_matrix
+  )
+
+
+names(
+  row_denominators
+) <-
+  rownames(
+    integration_matrix
+  )
+
+
+matrix_long <-
+  matrix_long %>%
+
+  mutate(
+
+    row_denom =
+      row_denominators[
+        row_type
+      ],
+
+    proportion =
+      ifelse(
+        row_denom > 0,
+        count /
+          row_denom,
+        NA_real_
+      ),
+
+    proportion_label =
+      case_when(
+
+        is.na(
+          proportion
+        ) ~
+          "",
+
+        proportion ==
+          1 ~
+          "1",
+
+        TRUE ~
+          sprintf(
+            "%.2f",
+            proportion
+          )
+      ),
+
+    row_type =
+      factor(
+        row_type,
+        levels =
+          rev(
+            names(
+              data_type_labels
+            )
+          )
+      ),
+
+    col_type =
+      factor(
+        col_type,
+        levels =
+          names(
+            data_type_labels
+          )
+      )
+  )
+
+
+integration_type_score <-
+  round(
+
+    rowSums(
+      integration_matrix,
+      na.rm = TRUE
+    ) /
+
+      nrow(
+        integration_data
+      ),
+
+    2
+  )
+
+
+integration_table <-
+  as.data.frame(
+    integration_matrix
+  ) %>%
+
+  rownames_to_column(
+    "Data type"
+  )
+
+
+integration_table$`Data type` <-
+  unname(
+    data_type_labels[
+      integration_table$`Data type`
+    ]
+  )
+
+
+names(
+  integration_table
+)[
+  2:ncol(
+    integration_table
+  )
+] <-
+
+  unname(
+
+    data_type_labels[
+      names(
+        integration_table
+      )[
+        2:ncol(
+          integration_table
+        )
+      ]
+    ]
+  )
+
+
+integration_table$Score <-
+  integration_type_score
+
+
+ft_integration_matrix <-
+  flextable(
+    integration_table
+  ) %>%
+
+  theme_booktabs() %>%
+
+  autofit() %>%
+
+  bold(
+    part =
+      "header"
+  ) %>%
+
+  align(
+    j = 1,
+    align = "left",
+    part = "all"
+  ) %>%
+
+  align(
+    j =
+      2:ncol(
+        integration_table
+      ),
+    align =
+      "center",
+    part =
+      "all"
+  ) %>%
+
+  fontsize(
+    size = 9,
+    part = "all"
+  ) %>%
+
+  bold(
+    j = "Score",
+    part = "body"
+  ) %>%
+
+  set_caption(
+    "Table. Data-type co-occurrence and integration score"
+  )
+
+
+ft_integration_matrix
+```
+
+```{r integration-heatmap, fig.width=12, fig.height=9}
+p_heat <-
+  ggplot(
+
+    matrix_long,
+
+    aes(
+
+      x =
+        col_type,
+
+      y =
+        row_type,
+
+      fill =
+        proportion
+    )
+  ) +
+
+  geom_tile(
+
+    colour =
+      "white",
+
+    linewidth =
+      0.45
+  ) +
+
+  geom_text(
+
+    aes(
+
+      label =
+        proportion_label,
+
+      colour =
+        proportion >
+          0.55
+    ),
+
+    size =
+      3
+  ) +
+
+  scale_colour_manual(
+
+    values =
+      c(
+        `FALSE` =
+          "black",
+        `TRUE` =
+          "white"
+      ),
+
+    guide =
+      "none"
+  ) +
+
+  scale_fill_gradient(
+
+    low =
+      "#EAF3FB",
+
+    high =
+      "#004B7A",
+
+    limits =
+      c(
+        0,
+        1
+      ),
+
+    labels =
+      percent_format(
+        accuracy = 1
+      ),
+
+    name =
+      "Proportion"
+  ) +
+
+  scale_x_discrete(
+
+    position =
+      "top",
+
+    labels =
+      data_type_labels
+  ) +
+
+  scale_y_discrete(
+
+    labels =
+      data_type_labels
+  ) +
+
+  labs(
+    x = NULL,
+    y = NULL
+  ) +
+
+  theme_minimal(
+    base_size =
+      11
+  ) +
+
+  theme(
+
+    panel.grid =
+      element_blank(),
+
+    axis.text.x.top =
+      element_text(
+        angle = 90,
+        hjust = 0,
+        vjust = 0.5,
+        size = 8.5,
+        colour = "black"
+      ),
+
+    axis.text.y =
+      element_text(
+        size = 8.5,
+        colour = "black"
+      ),
+
+    axis.text.x.bottom =
+      element_blank(),
+
+    axis.ticks =
+      element_blank()
+  )
+
+
+p_heat
+```
+
+# 18. Multivariable Poisson regression of data-integration score
+
+Disease outcome categories are not included as explanatory variables. The
+model includes region, setting, start decade, HDSS status and participant
+size.
+
+```{r regression-model}
+analytic_df <-
+  integration_scored %>%
+
+  mutate(
+
+    start_decade_collapsed =
+      case_when(
+
+        start_decade %in%
+          c(
+            "<=1970s",
+            "1980s"
+          ) ~
+          "<=1980s",
+
+        start_decade ==
+          "1990s" ~
+          "1990s",
+
+        start_decade ==
+          "2000s" ~
+          "2000s",
+
+        start_decade ==
+          "2010s" ~
+          "2010s",
+
+        start_decade ==
+          "2020s" ~
+          "2020s",
+
+        TRUE ~
+          NA_character_
+      ),
+
+    region =
+      factor(
+
+        region,
+
+        levels =
+          c(
+            "East Africa",
+            "Central Africa",
+            "Multinational",
+            "North Africa",
+            "Southern Africa",
+            "West Africa"
+          )
+      ),
+
+    setting_clean =
+      factor(
+
+        setting_clean,
+
+        levels =
+          c(
+            "Urban",
+            "Rural",
+            "Mixed rural and urban"
+          )
+      ),
+
+    start_decade_collapsed =
+      factor(
+
+        start_decade_collapsed,
+
+        levels =
+          c(
+            "<=1980s",
+            "1990s",
+            "2000s",
+            "2010s",
+            "2020s"
+          )
+      ),
+
+    hdss_binary =
+      case_when(
+
+        hdss_clean ==
+          "HDSS" ~
+          "HDSS",
+
+        hdss_clean ==
+          "Non-HDSS" ~
+          "Non-HDSS",
+
+        TRUE ~
+          NA_character_
+      ),
+
+    hdss_binary =
+      factor(
+
+        hdss_binary,
+
+        levels =
+          c(
+            "Non-HDSS",
+            "HDSS"
+          )
+      ),
+
+    participant_size_cat =
+      factor(
+
+        participant_size_cat,
+
+        levels =
+          c(
+            "<1,000",
+            "1,000-19,999",
+            "20,000-99,999",
+            ">=100,000"
+          )
+      )
+  )
+
+
+model_df <-
+  analytic_df %>%
+
+  filter(
+
+    !is.na(
+      data_integration_score
+    ),
+
+    !is.na(
+      region
+    ),
+
+    !is.na(
+      setting_clean
+    ),
+
+    !is.na(
+      start_decade_collapsed
+    ),
+
+    !is.na(
+      hdss_binary
+    ),
+
+    !is.na(
+      participant_size_cat
+    )
+  )
+
+
+cat(
+  "Regression model N =",
+  nrow(model_df),
+  "\n"
+)
+
+
+m_pois <-
+  glm(
+
+    data_integration_score ~
+
+      region +
+
+      setting_clean +
+
+      start_decade_collapsed +
+
+      hdss_binary +
+
+      participant_size_cat,
+
+    data =
+      model_df,
+
+    family =
+      poisson(
+        link = "log"
+      )
+  )
+
+
+vcov_robust <-
+  sandwich::vcovHC(
+    m_pois,
+    type = "HC0"
+  )
+
+
+robust_test <-
+  lmtest::coeftest(
+    m_pois,
+    vcov. =
+      vcov_robust
+  )
+
+
+model_results <-
+  tibble(
+
+    term =
+      rownames(
+        robust_test
+      ),
+
+    estimate =
+      robust_test[
+        ,
+        "Estimate"
+      ],
+
+    std.error =
+      robust_test[
+        ,
+        "Std. Error"
+      ],
+
+    statistic =
+      robust_test[
+        ,
+        "z value"
+      ],
+
+    p.value =
+      robust_test[
+        ,
+        "Pr(>|z|)"
+      ]
+  ) %>%
+
+  mutate(
+
+    rr =
+      exp(
+        estimate
+      ),
+
+    conf.low =
+      exp(
+        estimate -
+          1.96 *
+          std.error
+      ),
+
+    conf.high =
+      exp(
+        estimate +
+          1.96 *
+          std.error
+      )
+  )
+
+
+model_results_clean <-
+  model_results %>%
+
+  filter(
+    term !=
+      "(Intercept)"
+  ) %>%
+
+  mutate(
+
+    variable =
+      case_when(
+
+        str_detect(
+          term,
+          "^region"
+        ) ~
+          "Region",
+
+        str_detect(
+          term,
+          "^setting_clean"
+        ) ~
+          "Setting",
+
+        str_detect(
+          term,
+          "^start_decade_collapsed"
+        ) ~
+          "Start decade",
+
+        str_detect(
+          term,
+          "^hdss_binary"
+        ) ~
+          "HDSS status",
+
+        str_detect(
+          term,
+          "^participant_size_cat"
+        ) ~
+          "Participant size",
+
+        TRUE ~
+          NA_character_
+      ),
+
+    level =
+      case_when(
+
+        str_detect(
+          term,
+          "^region"
+        ) ~
+          str_remove(
+            term,
+            "^region"
+          ),
+
+        str_detect(
+          term,
+          "^setting_clean"
+        ) ~
+          str_remove(
+            term,
+            "^setting_clean"
+          ),
+
+        str_detect(
+          term,
+          "^start_decade_collapsed"
+        ) ~
+          str_remove(
+            term,
+            "^start_decade_collapsed"
+          ),
+
+        str_detect(
+          term,
+          "^hdss_binary"
+        ) ~
+          str_remove(
+            term,
+            "^hdss_binary"
+          ),
+
+        str_detect(
+          term,
+          "^participant_size_cat"
+        ) ~
+          str_remove(
+            term,
+            "^participant_size_cat"
+          ),
+
+        TRUE ~
+          NA_character_
+      ),
+
+    p_value_label =
+      ifelse(
+
+        p.value <
+          0.001,
+
+        "<0.001",
+
+        sprintf(
+          "%.3f",
+          p.value
+        )
+      )
+  )
+
+
+model_results_clean %>%
+
+  select(
+    variable,
+    level,
+    rr,
+    conf.low,
+    conf.high,
+    p.value
+  )
+```
+
+```{r regression-table}
+count_region <-
+  model_df %>%
+
+  count(
+    region,
+    name = "n"
+  ) %>%
+
+  transmute(
+
+    variable =
+      "Region",
+
+    level =
+      as.character(
+        region
+      ),
+
+    n_label =
+      paste0(
+        "(n=",
+        n,
+        ")"
+      )
+  )
+
+
+count_setting <-
+  model_df %>%
+
+  count(
+    setting_clean,
+    name = "n"
+  ) %>%
+
+  transmute(
+
+    variable =
+      "Setting",
+
+    level =
+      as.character(
+        setting_clean
+      ),
+
+    n_label =
+      paste0(
+        "(n=",
+        n,
+        ")"
+      )
+  )
+
+
+count_decade <-
+  model_df %>%
+
+  count(
+    start_decade_collapsed,
+    name = "n"
+  ) %>%
+
+  transmute(
+
+    variable =
+      "Start decade",
+
+    level =
+      as.character(
+        start_decade_collapsed
+      ),
+
+    n_label =
+      paste0(
+        "(n=",
+        n,
+        ")"
+      )
+  )
+
+
+count_hdss <-
+  model_df %>%
+
+  count(
+    hdss_binary,
+    name = "n"
+  ) %>%
+
+  transmute(
+
+    variable =
+      "HDSS status",
+
+    level =
+      as.character(
+        hdss_binary
+      ),
+
+    n_label =
+      paste0(
+        "(n=",
+        n,
+        ")"
+      )
+  )
+
+
+count_size <-
+  model_df %>%
+
+  count(
+    participant_size_cat,
+    name = "n"
+  ) %>%
+
+  transmute(
+
+    variable =
+      "Participant size",
+
+    level =
+      as.character(
+        participant_size_cat
+      ),
+
+    n_label =
+      paste0(
+        "(n=",
+        n,
+        ")"
+      )
+  )
+
+
+counts_all <-
+  bind_rows(
+    count_region,
+    count_setting,
+    count_decade,
+    count_hdss,
+    count_size
+  )
+
+
+reference_levels <-
+  tibble(
+
+    variable =
+      c(
+        "Region",
+        "Setting",
+        "Start decade",
+        "HDSS status",
+        "Participant size"
+      ),
+
+    level =
+      c(
+        "East Africa",
+        "Urban",
+        "<=1980s",
+        "Non-HDSS",
+        "<1,000"
+      )
+  )
+
+
+estimates_table <-
+  model_results_clean %>%
+
+  transmute(
+
+    variable,
+
+    level,
+
+    RR =
+      sprintf(
+        "%.2f",
+        rr
+      ),
+
+    `95% CI` =
+      sprintf(
+        "%.2f, %.2f",
+        conf.low,
+        conf.high
+      ),
+
+    `P-value` =
+      p_value_label
+  )
+
+
+table_body <-
+  counts_all %>%
+
+  left_join(
+
+    estimates_table,
+
+    by =
+      c(
+        "variable",
+        "level"
+      )
+  ) %>%
+
+  left_join(
+
+    reference_levels %>%
+      mutate(
+        reference =
+          TRUE
+      ),
+
+    by =
+      c(
+        "variable",
+        "level"
+      )
+  ) %>%
+
+  mutate(
+
+    RR =
+      if_else(
+        reference %in%
+          TRUE,
+        "Reference",
+        RR
+      ),
+
+    `95% CI` =
+      if_else(
+        reference %in%
+          TRUE,
+        "",
+        `95% CI`
+      ),
+
+    `P-value` =
+      if_else(
+        reference %in%
+          TRUE,
+        "",
+        `P-value`
+      )
+  )
+
+
+make_section <- function(
+    data,
+    section
+) {
+
+  bind_rows(
+
+    tibble(
+
+      variable =
+        section,
+
+      level =
+        "",
+
+      n_label =
+        "",
+
+      RR =
+        "",
+
+      `95% CI` =
+        "",
+
+      `P-value` =
+        ""
+    ),
+
+    data %>%
+
+      filter(
+        variable ==
+          section
+      ) %>%
+
+      select(
+        variable,
+        level,
+        n_label,
+        RR,
+        `95% CI`,
+        `P-value`
+      )
+  )
+}
+
+
+table_display <-
+  bind_rows(
+
+    make_section(
+      table_body,
+      "Region"
+    ),
+
+    make_section(
+      table_body,
+      "Setting"
+    ),
+
+    make_section(
+      table_body,
+      "Start decade"
+    ),
+
+    make_section(
+      table_body,
+      "HDSS status"
+    ),
+
+    make_section(
+      table_body,
+      "Participant size"
+    )
+  ) %>%
+
+  mutate(
+
+    Characteristic =
+      if_else(
+        level == "",
+        variable,
+        level
+      ),
+
+    `(n)` =
+      n_label
+  ) %>%
+
+  select(
+    Characteristic,
+    `(n)`,
+    RR,
+    `95% CI`,
+    `P-value`
+  )
+
+
+ft_regression_style <-
+  flextable(
+    table_display
+  ) %>%
+
+  theme_booktabs() %>%
+
+  autofit() %>%
+
+  fontsize(
+    size = 10,
+    part = "all"
+  ) %>%
+
+  bold(
+    part =
+      "header"
+  ) %>%
+
+  align(
+    j = 1,
+    align = "left",
+    part = "all"
+  ) %>%
+
+  align(
+    j = 2:5,
+    align = "center",
+    part = "all"
+  ) %>%
+
+  bg(
+
+    i =
+      ~ `(n)` == "" &
+      RR == "" &
+      `95% CI` == "" &
+      `P-value` == "",
+
+    bg =
+      "#D9D9D9",
+
+    part =
+      "body"
+  ) %>%
+
+  bold(
+
+    i =
+      ~ `(n)` == "" &
+      RR == "" &
+      `95% CI` == "" &
+      `P-value` == "",
+
+    bold =
+      TRUE,
+
+    part =
+      "body"
+  ) %>%
+
+  set_caption(
+
+    paste0(
+      "Table. Multivariable Poisson regression of factors associated with ",
+      "data integration score (N=",
+      nrow(model_df),
+      ")."
+    )
+  )
+
+
+ft_regression_style
+```
+
+```{r regression-forest, fig.width=10, fig.height=7}
+level_order_tbl <-
+  tibble::tribble(
+
+    ~variable,
+    ~level,
+    ~block_order,
+    ~order_within,
+
+    "Region",
+    "East Africa",
+    1,
+    1,
+
+    "Region",
+    "Central Africa",
+    1,
+    2,
+
+    "Region",
+    "Multinational",
+    1,
+    3,
+
+    "Region",
+    "North Africa",
+    1,
+    4,
+
+    "Region",
+    "Southern Africa",
+    1,
+    5,
+
+    "Region",
+    "West Africa",
+    1,
+    6,
+
+    "Setting",
+    "Urban",
+    2,
+    1,
+
+    "Setting",
+    "Rural",
+    2,
+    2,
+
+    "Setting",
+    "Mixed rural and urban",
+    2,
+    3,
+
+    "Start decade",
+    "<=1980s",
+    3,
+    1,
+
+    "Start decade",
+    "1990s",
+    3,
+    2,
+
+    "Start decade",
+    "2000s",
+    3,
+    3,
+
+    "Start decade",
+    "2010s",
+    3,
+    4,
+
+    "Start decade",
+    "2020s",
+    3,
+    5,
+
+    "HDSS status",
+    "Non-HDSS",
+    4,
+    1,
+
+    "HDSS status",
+    "HDSS",
+    4,
+    2,
+
+    "Participant size",
+    "<1,000",
+    5,
+    1,
+
+    "Participant size",
+    "1,000-19,999",
+    5,
+    2,
+
+    "Participant size",
+    "20,000-99,999",
+    5,
+    3,
+
+    "Participant size",
+    ">=100,000",
+    5,
+    4
+  )
+
+
+forest_ref_rows <-
+  reference_levels %>%
+
+  transmute(
+
+    variable,
+
+    level,
+
+    label_short =
+      paste0(
+        level,
+        " (Ref)"
+      ),
+
+    rr =
+      1,
+
+    conf.low =
+      1,
+
+    conf.high =
+      1,
+
+    p.value =
+      NA_real_,
+
+    p_label =
+      "Ref",
+
+    sig =
+      FALSE,
+
+    is_reference =
+      TRUE
+  )
+
+
+forest_est_rows <-
+  model_results_clean %>%
+
+  mutate(
+
+    label_short =
+      paste0(
+        "   ",
+        level
+      ),
+
+    p_label =
+      case_when(
+
+        p.value <
+          0.001 ~
+          "<0.001*",
+
+        p.value <
+          0.05 ~
+          paste0(
+            sprintf(
+              "%.3f",
+              p.value
+            ),
+            "*"
+          ),
+
+        TRUE ~
+          sprintf(
+            "%.3f",
+            p.value
+          )
+      ),
+
+    sig =
+      p.value <
+        0.05,
+
+    is_reference =
+      FALSE
+  ) %>%
+
+  select(
+
+    variable,
+    level,
+    label_short,
+    rr,
+    conf.low,
+    conf.high,
+    p.value,
+    p_label,
+    sig,
+    is_reference
+  )
+
+
+forest_df <-
+  bind_rows(
+    forest_ref_rows,
+    forest_est_rows
+  ) %>%
+
+  left_join(
+
+    level_order_tbl,
+
+    by =
+      c(
+        "variable",
+        "level"
+      )
+  ) %>%
+
+  arrange(
+    block_order,
+    order_within
+  ) %>%
+
+  mutate(
+    y_pos =
+      rev(
+        seq_len(
+          n()
+        )
+      )
+  )
+
+
+xmax_plot <-
+  max(
+
+    1.8,
+
+    max(
+      forest_df$conf.high,
+      na.rm = TRUE
+    ) * 1.35
+  )
+
+
+x_pval <-
+  xmax_plot *
+  0.98
+
+
+p_forest <-
+  ggplot(
+
+    forest_df,
+
+    aes(
+      x = rr,
+      y = y_pos
+    )
+  ) +
+
+  geom_vline(
+
+    xintercept =
+      1,
+
+    linetype =
+      "dotted",
+
+    colour =
+      "red",
+
+    linewidth =
+      0.8
+  ) +
+
+  geom_errorbar(
+
+    data =
+      forest_df %>%
+      filter(
+        !is_reference
+      ),
+
+    aes(
+      xmin =
+        conf.low,
+      xmax =
+        conf.high
+    ),
+
+    width =
+      0.18,
+
+    colour =
+      "grey45",
+
+    linewidth =
+      0.6
+  ) +
+
+  geom_point(
+
+    aes(
+      fill =
+        sig,
+      shape =
+        is_reference
+    ),
+
+    size =
+      2.8,
+
+    colour =
+      "#004B7A",
+
+    stroke =
+      0.4
+  ) +
+
+  geom_text(
+
+    aes(
+      x =
+        x_pval,
+      label =
+        p_label
+    ),
+
+    hjust =
+      1,
+
+    size =
+      3.2
+  ) +
+
+  scale_shape_manual(
+
+    values =
+      c(
+        `TRUE` =
+          22,
+        `FALSE` =
+          21
+      ),
+
+    guide =
+      "none"
+  ) +
+
+  scale_fill_manual(
+
+    values =
+      c(
+        `TRUE` =
+          "#B30000",
+        `FALSE` =
+          "#004B7A"
+      ),
+
+    guide =
+      "none"
+  ) +
+
+  scale_y_continuous(
+
+    breaks =
+      forest_df$y_pos,
+
+    labels =
+      forest_df$label_short,
+
+    expand =
+      expansion(
+        mult =
+          c(
+            0.02,
+            0.06
+          )
+      )
+  ) +
+
+  scale_x_continuous(
+
+    limits =
+      c(
+        0,
+        xmax_plot
+      ),
+
+    breaks =
+      pretty(
+        c(
+          0,
+          xmax_plot
+        ),
+        n = 6
+      )
+  ) +
+
+  labs(
+
+    x =
+      "Rate Ratio (RR)",
+
+    y =
+      NULL
+  ) +
+
+  theme_minimal(
+    base_size =
+      12
+  ) +
+
+  theme(
+
+    panel.grid.major.y =
+      element_blank(),
+
+    panel.grid.minor =
+      element_blank(),
+
+    axis.text.y =
+      element_text(
+        size = 9
+      ),
+
+    plot.margin =
+      margin(
+        10,
+        35,
+        10,
+        10
+      )
+  ) +
+
+  coord_cartesian(
+    clip =
+      "off"
+  )
+
+
+p_forest
+```
+
+# 19. Temporal trends
+
+```{r time-trends, fig.width=9, fig.height=5.5}
+time_data <-
+  cohort_clean %>%
+
+  filter(
+    !is.na(
+      start_year_num
+    )
+  ) %>%
+
+  mutate(
+
+    decade =
+      floor(
+        start_year_num /
+          10
+      ) * 10,
+
+    interface_clean =
+      broad_interface_cleaned
+  )
+
+
+time_all <-
+  time_data %>%
+
+  count(
+    decade,
+    name = "n"
+  ) %>%
+
+  mutate(
+    series =
+      "All cohorts"
+  )
+
+
+time_he <-
+  time_data %>%
+
+  filter(
+    interface_clean ==
+      "Human-Environmental"
+  ) %>%
+
+  count(
+    decade,
+    name = "n"
+  ) %>%
+
+  mutate(
+    series =
+      "Human-Environmental"
+  )
+
+
+time_hae <-
+  time_data %>%
+
+  filter(
+    interface_clean ==
+      "Human-Animal-Environmental"
+  ) %>%
+
+  count(
+    decade,
+    name = "n"
+  ) %>%
+
+  mutate(
+    series =
+      "Human-Animal-Environmental"
+  )
+
+
+time_line_data <-
+  bind_rows(
+    time_all,
+    time_he,
+    time_hae
+  ) %>%
+
+  mutate(
+
+    series =
+      factor(
+
+        series,
+
+        levels =
+          c(
+            "All cohorts",
+            "Human-Environmental",
+            "Human-Animal-Environmental"
+          )
+      )
+  )
+
+
+line_palette <- c(
+
+  "All cohorts" =
+    "#004B7A",
+
+  "Human-Environmental" =
+    "#3B8BC2",
+
+  "Human-Animal-Environmental" =
+    "#B30000"
+)
+
+
+p_time_line <-
+  ggplot(
+
+    time_line_data,
+
+    aes(
+
+      x =
+        decade,
+
+      y =
+        n,
+
+      colour =
+        series,
+
+      group =
+        series
+    )
+  ) +
+
+  geom_line(
+    linewidth =
+      1.2
+  ) +
+
+  geom_point(
+    size =
+      3
+  ) +
+
+  scale_color_manual(
+    values =
+      line_palette
+  ) +
+
+  scale_x_continuous(
+
+    breaks =
+      seq(
+        min(
+          time_line_data$decade
+        ),
+        max(
+          time_line_data$decade
+        ),
+        by = 10
+      )
+  ) +
+
+  labs(
+
+    x =
+      "Start decade",
+
+    y =
+      "Number of cohorts",
+
+    colour =
+      NULL
+  ) +
+
+  theme_minimal(
+    base_size =
+      13
+  ) +
+
+  theme(
+    panel.grid.minor =
+      element_blank()
+  )
+
+
+p_time_line
+```
+
+# 20. Geographic distribution
+
+Multinational cohorts are counted once in each African country in which
+they were conducted. `cohort_id`, rather than harmonised cohort name, is
+used so that distinct cohort/site records are preserved.
+
+```{r geographic-data}
+country_long <-
+  cohort_clean %>%
+
+  transmute(
+
+    cohort_id,
+
+    cohort_name,
+
+    country =
+      str_squish(
+        country_raw
+      ),
+
+    broad_interface_cleaned
+  ) %>%
+
+  mutate(
+
+    country =
+      str_replace_all(
+        country,
+        "\u2019",
+        "'"
+      ),
+
+    country =
+      case_when(
+
+        str_detect(
+          country,
+          regex(
+            "African sites include",
+            ignore_case = TRUE
+          )
+        ) ~
+
+          str_replace(
+            country,
+            regex(
+              "^.*African sites include\\s*",
+              ignore_case = TRUE
+            ),
+            ""
+          ),
+
+        str_detect(
+          country,
+          regex(
+            "^Multinational\\s*\\(",
+            ignore_case = TRUE
+          )
+        ) ~
+
+          str_replace(
+            country,
+            regex(
+              "^Multinational\\s*\\(([^)]*)\\).*$",
+              ignore_case = TRUE
+            ),
+            "\\1"
+          ),
+
+        TRUE ~
+          country
+      ),
+
+    country =
+      str_remove(
+        country,
+        "[\\.]+$"
+      )
+  ) %>%
+
+  filter(
+    !is.na(country),
+    country != ""
+  ) %>%
+
+  separate_rows(
+
+    country,
+
+    sep =
+      "\\s*[,;|/]\\s*|\\s+and\\s+"
+  ) %>%
+
+  mutate(
+
+    country =
+      str_squish(
+        country
+      ),
+
+    country =
+      case_when(
+
+        country %in%
+          c(
+            "The Gambia",
+            "Gambia"
+          ) ~
+          "Gambia",
+
+        country %in%
+          c(
+            "Côte d'Ivoire",
+            "Cote d'Ivoire",
+            "Ivory Coast"
+          ) ~
+          "Côte d'Ivoire",
+
+        country %in%
+          c(
+            "Democratic Republic of Congo",
+            "Democratic Republic of the Congo",
+            "DR Congo",
+            "DRC"
+          ) ~
+          "Democratic Republic of the Congo",
+
+        country %in%
+          c(
+            "Republic of Congo",
+            "Congo Republic",
+            "Congo"
+          ) ~
+          "Republic of the Congo",
+
+        TRUE ~
+          country
+      ),
+
+    iso3 =
+      countrycode(
+
+        country,
+
+        origin =
+          "country.name",
+
+        destination =
+          "iso3c"
+      ),
+
+    iso3 =
+      case_when(
+
+        country ==
+          "Côte d'Ivoire" ~
+          "CIV",
+
+        country ==
+          "Democratic Republic of the Congo" ~
+          "COD",
+
+        country ==
+          "Republic of the Congo" ~
+          "COG",
+
+        country ==
+          "Gambia" ~
+          "GMB",
+
+        TRUE ~
+          iso3
+      )
+  ) %>%
+
+  filter(
+    !is.na(
+      iso3
+    )
+  ) %>%
+
+  distinct(
+    cohort_id,
+    iso3,
+    .keep_all =
+      TRUE
+  )
+
+
+coh_total <-
+  country_long %>%
+
+  distinct(
+    cohort_id,
+    iso3
+  ) %>%
+
+  count(
+    iso3,
+    name =
+      "n_cohorts"
+  ) %>%
+
+  mutate(
+    panel =
+      "All cohorts\n(Human–Environmental data)"
+  )
+
+
+coh_hae <-
+  country_long %>%
+
+  filter(
+    broad_interface_cleaned ==
+      "Human-Animal-Environmental"
+  ) %>%
+
+  distinct(
+    cohort_id,
+    iso3
+  ) %>%
+
+  count(
+    iso3,
+    name =
+      "n_cohorts"
+  ) %>%
+
+  mutate(
+    panel =
+      "Human–Animal–Environmental cohorts"
+  )
+
+
+panel_levels <- c(
+
+  "All cohorts\n(Human–Environmental data)",
+
+  "Human–Animal–Environmental cohorts"
+)
+
+
+coh_counts_facets <-
+  bind_rows(
+    coh_total,
+    coh_hae
+  ) %>%
+
+  mutate(
+
+    panel =
+      factor(
+        panel,
+        levels =
+          panel_levels
+      )
+  )
+
+
+africa_sf <-
+  rnaturalearth::ne_countries(
+
+    scale =
+      "medium",
+
+    continent =
+      "Africa",
+
+    returnclass =
+      "sf"
+  ) %>%
+
+  select(
+    name_long,
+    adm0_a3,
+    geometry
+  ) %>%
+
+  rename(
+    name =
+      name_long,
+    iso3 =
+      adm0_a3
+  )
+
+
+grid_all <-
+  tidyr::expand_grid(
+
+    iso3 =
+      africa_sf$iso3,
+
+    panel =
+      factor(
+        panel_levels,
+        levels =
+          panel_levels
+      )
+  )
+
+
+africa_facets <-
+  africa_sf %>%
+
+  st_drop_geometry() %>%
+
+  select(
+    iso3,
+    name
+  ) %>%
+
+  distinct() %>%
+
+  right_join(
+    grid_all,
+    by =
+      "iso3"
+  ) %>%
+
+  left_join(
+
+    coh_counts_facets,
+
+    by =
+      c(
+        "iso3",
+        "panel"
+      )
+  ) %>%
+
+  mutate(
+
+    n_cohorts =
+      replace_na(
+        n_cohorts,
+        0L
+      ),
+
+    fill_value =
+      ifelse(
+        n_cohorts == 0,
+        NA,
+        n_cohorts
+      )
+  ) %>%
+
+  left_join(
+
+    africa_sf,
+
+    by =
+      c(
+        "iso3",
+        "name"
+      )
+  ) %>%
+
+  st_as_sf()
+
+
+label_points <-
+  africa_sf %>%
+
+  st_point_on_surface() %>%
+
+  mutate(
+
+    X =
+      st_coordinates(.)[
+        ,
+        1
+      ],
+
+    Y =
+      st_coordinates(.)[
+        ,
+        2
+      ]
+  ) %>%
+
+  st_drop_geometry() %>%
+
+  select(
+    iso3,
+    name,
+    X,
+    Y
+  )
+
+
+label_df <-
+  africa_facets %>%
+
+  st_drop_geometry() %>%
+
+  filter(
+    n_cohorts > 0
+  ) %>%
+
+  left_join(
+
+    label_points,
+
+    by =
+      c(
+        "iso3",
+        "name"
+      )
+  ) %>%
+
+  mutate(
+
+    short_name =
+      recode(
+
+        name,
+
+        "Côte d'Ivoire" =
+          "Côte d’Ivoire",
+
+        "Guinea-Bissau" =
+          "G.-Bissau",
+
+        "Central African Republic" =
+          "C.A.R.",
+
+        "Democratic Republic of the Congo" =
+          "DR Congo",
+
+        "Republic of the Congo" =
+          "Congo",
+
+        "Equatorial Guinea" =
+          "Eq. Guinea",
+
+        .default =
+          name
+      ),
+
+    label_full =
+      paste0(
+        short_name,
+        "\n",
+        n_cohorts
+      )
+  )
+```
+
+```{r africa-map, fig.width=14, fig.height=8}
+map_max <-
+  max(
+    africa_facets$n_cohorts,
+    na.rm = TRUE
+  )
+
+
+p_facets_map <-
+  ggplot() +
+
+  geom_sf(
+
+    data =
+      africa_facets,
+
+    aes(
+      fill =
+        fill_value
+    ),
+
+    color =
+      "grey45",
+
+    linewidth =
+      0.25
+  ) +
+
+  scale_fill_gradientn(
+
+    colours =
+      c(
+        "#EAF3FB",
+        "#9CCBEA",
+        "#3B8BC2",
+        "#004B7A"
+      ),
+
+    na.value =
+      "grey92",
+
+    limits =
+      c(
+        1,
+        map_max
+      ),
+
+    name =
+      "Number of cohorts"
+  ) +
+
+  ggrepel::geom_text_repel(
+
+    data =
+      label_df,
+
+    aes(
+
+      x =
+        X,
+
+      y =
+        Y,
+
+      label =
+        label_full
+    ),
+
+    size =
+      2.4,
+
+    lineheight =
+      0.88,
+
+    box.padding =
+      0.25,
+
+    point.padding =
+      0.10,
+
+    min.segment.length =
+      0,
+
+    segment.color =
+      "grey45",
+
+    segment.size =
+      0.20,
+
+    max.overlaps =
+      Inf,
+
+    seed =
+      123
+  ) +
+
+  coord_sf(
+
+    xlim =
+      c(
+        -30,
+        58
+      ),
+
+    ylim =
+      c(
+        -37,
+        39
+      ),
+
+    expand =
+      FALSE,
+
+    clip =
+      "off"
+  ) +
+
+  facet_wrap(
+
+    ~panel,
+
+    ncol =
+      2,
+
+    drop =
+      FALSE
+  ) +
+
+  ggspatial::annotation_north_arrow(
+
+    location =
+      "tr",
+
+    which_north =
+      "true",
+
+    height =
+      grid::unit(
+        0.75,
+        "cm"
+      ),
+
+    width =
+      grid::unit(
+        0.75,
+        "cm"
+      ),
+
+    style =
+      ggspatial::north_arrow_fancy_orienteering
+  ) +
+
+  ggspatial::annotation_scale(
+
+    location =
+      "bl",
+
+    width_hint =
+      0.28,
+
+    text_cex =
+      0.60
+  ) +
+
+  theme_void(
+    base_size =
+      12
+  ) +
+
+  theme(
+
+    strip.text =
+      element_text(
+        face = "bold",
+        size = 11
+      ),
+
+    legend.position =
+      "right",
+
+    plot.margin =
+      margin(
+        5,
+        15,
+        5,
+        15
+      )
+  )
+
+
+p_facets_map
+```
+
+# 21. Country and region summaries
+
+```{r country-region-summaries}
+country_summary_total <-
+  country_long %>%
+
+  distinct(
+    cohort_id,
+    country,
+    iso3
+  ) %>%
+
+  count(
+    country,
+    name =
+      "Total cohorts"
+  ) %>%
+
+  arrange(
+    desc(
+      `Total cohorts`
+    ),
+    country
+  )
+
+
+country_summary_interface <-
+  country_long %>%
+
+  filter(
+    !is.na(
+      broad_interface_cleaned
+    )
+  ) %>%
+
+  distinct(
+    cohort_id,
+    country,
+    broad_interface_cleaned
+  ) %>%
+
+  count(
+    country,
+    broad_interface_cleaned,
+    name =
+      "n"
+  ) %>%
+
+  pivot_wider(
+
+    names_from =
+      broad_interface_cleaned,
+
+    values_from =
+      n,
+
+    values_fill =
+      0
+  )
+
+
+country_summary_table <-
+  country_summary_total %>%
+
+  left_join(
+    country_summary_interface,
+    by =
+      "country"
+  ) %>%
+
+  rename(
+    Country =
+      country
+  )
+
+
+country_summary_table
+
+
+country_long_region <-
+  country_long %>%
+
+  mutate(
+
+    region =
+      case_when(
+
+        iso3 %in%
+          c(
+            "KEN",
+            "UGA",
+            "TZA",
+            "ETH",
+            "SDN",
+            "SSD",
+            "RWA",
+            "BDI",
+            "ERI",
+            "SOM",
+            "DJI",
+            "SYC"
+          ) ~
+          "East Africa",
+
+        iso3 %in%
+          c(
+            "GHA",
+            "NGA",
+            "GMB",
+            "SEN",
+            "MLI",
+            "BFA",
+            "NER",
+            "BEN",
+            "CIV",
+            "GNB",
+            "GIN",
+            "LBR",
+            "SLE",
+            "TGO"
+          ) ~
+          "West Africa",
+
+        iso3 %in%
+          c(
+            "ZAF",
+            "ZWE",
+            "ZMB",
+            "MOZ",
+            "MWI",
+            "NAM",
+            "BWA",
+            "AGO",
+            "MDG",
+            "MUS",
+            "LSO",
+            "SWZ"
+          ) ~
+          "Southern Africa",
+
+        iso3 %in%
+          c(
+            "COD",
+            "COG",
+            "CAF",
+            "CMR",
+            "TCD",
+            "GAB",
+            "GNQ"
+          ) ~
+          "Central Africa",
+
+        iso3 %in%
+          c(
+            "EGY",
+            "DZA",
+            "MAR",
+            "TUN",
+            "LBY"
+          ) ~
+          "North Africa",
+
+        TRUE ~
+          "Other/unclear"
+      )
+  )
+
+
+region_summary_table <-
+  country_long_region %>%
+
+  distinct(
+    cohort_id,
+    country,
+    region
+  ) %>%
+
+  count(
+    region,
+    name =
+      "Total cohort-country observations"
+  ) %>%
+
+  arrange(
+    desc(
+      `Total cohort-country observations`
+    )
+  )
+
+
+region_summary_table
+```
+
+# 22. Recruitment strategies
+
+```{r recruitment-strategies}
+cohort_master <-
+  cohort_master %>%
+
+  mutate(
+
+    recruitment_method_clean =
+      recruitment_method %>%
+
+      as.character() %>%
+
+      str_to_lower() %>%
+
+      str_replace_all(
+        "–|—",
+        "-"
+      ) %>%
+
+      str_squish(),
+
+    recruitment_strategy_group =
+      case_when(
+
+        str_detect(
+          recruitment_method_clean,
+          "convenience"
+        ) ~
+          "Convenience sampling",
+
+        str_detect(
+          recruitment_method_clean,
+          paste0(
+            "facility|hospital|clinic|antenatal|prenatal|maternity|delivery|",
+            "health centre|health-facility|clinical|routine clinical"
+          )
+        ) ~
+          "Facility-based recruitment",
+
+        str_detect(
+          recruitment_method_clean,
+          paste0(
+            "pregnant women|newborn|children|birth cohort|school-based|",
+            "male children|dog-bite|occupational|poultry|seasonal recruitment|",
+            "administrative enrolment|retrospective extraction|prospective cohort"
+          )
+        ) ~
+          "Specific population recruitment",
+
+        str_detect(
+          recruitment_method_clean,
+          paste0(
+            "random|cluster|stratified|multistage|multi-stage|systematic|",
+            "representative|subsample|panel survey|sampling|spatial transects"
+          )
+        ) ~
+          "Probability-based sampling",
+
+        str_detect(
+          recruitment_method_clean,
+          paste0(
+            "community|village|community health volunteers|chvs|parents|",
+            "guardians|local|house-to-house"
+          )
+        ) ~
+          "Community-based recruitment",
+
+        str_detect(
+          recruitment_method_clean,
+          paste0(
+            "household|census|enumeration|enumaration|population-based|",
+            "population based|population census|population enumeration|hdss|",
+            "surveillance|sample registration system|dynamic enrollment|",
+            "longitudinal demographic|continuous demographic|open population|",
+            "dynamic cohort|whole population|whole-population|",
+            "complete population|entire village|door-to-door|door-door"
+          )
+        ) ~
+          "Household / population census and enumeration",
+
+        TRUE ~
+          NA_character_
+      )
+  )
+
+
+unclassified_recruitment <-
+  cohort_master %>%
+
+  filter(
+    is.na(
+      recruitment_strategy_group
+    )
+  ) %>%
+
+  count(
+    recruitment_method,
+    sort =
+      TRUE
+  )
+
+
+unclassified_recruitment
+
+
+recruitment_summary <-
+  cohort_master %>%
+
+  filter(
+    !is.na(
+      recruitment_strategy_group
+    )
+  ) %>%
+
+  count(
+    recruitment_strategy_group,
+    sort =
+      TRUE
+  ) %>%
+
+  mutate(
+
+    percent =
+      round(
+        100 *
+          n /
+          nrow(
+            cohort_master
+          ),
+        1
+      ),
+
+    `N (%)` =
+      paste0(
+        n,
+        " (",
+        percent,
+        "%)"
+      )
+  )
+
+
+recruitment_summary_ft <-
+  recruitment_summary %>%
+
+  select(
+
+    `Recruitment strategy` =
+      recruitment_strategy_group,
+
+    `N (%)`
+  ) %>%
+
+  flextable() %>%
+
+  theme_booktabs() %>%
+
+  autofit() %>%
+
+  align(
+    part =
+      "all",
+    align =
+      "left"
+  ) %>%
+
+  align(
+    j =
+      "N (%)",
+    align =
+      "center",
+    part =
+      "all"
+  ) %>%
+
+  bold(
+    part =
+      "header"
+  ) %>%
+
+  set_caption(
+    "Recruitment strategies of included cohorts"
+  )
+
+
+recruitment_summary_ft
+```
+
+# 23. Save final analysis datasets and key figures
+
+```{r save-outputs}
+write.csv(
+  cohort_clean,
+  "cohort_analysis_dataset.csv",
+  row.names = FALSE
+)
+
+
+write.csv(
+  infectious_outcome_counts,
+  "infectious_outcome_summary.csv",
+  row.names = FALSE
+)
+
+
+write.csv(
+  model_results_clean,
+  "data_integration_regression_results.csv",
+  row.names = FALSE
+)
+
+
+ggsave(
+  "figure_infectious_outcomes.png",
+  p_infectious_outcomes,
+  width = 12,
+  height = 8,
+  dpi = 300
+)
+
+
+ggsave(
+  "figure_data_integration_forest.png",
+  p_forest,
+  width = 10,
+  height = 7,
+  dpi = 300
+)
+
+
+ggsave(
+  "figure_africa_cohort_maps.png",
+  p_facets_map,
+  width = 14,
+  height = 8,
+  dpi = 300
+)
+```
+
+# 24. Reproducibility information
+
+```{r session-info}
+sessionInfo()
+```
